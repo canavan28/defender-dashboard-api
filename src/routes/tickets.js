@@ -9,19 +9,21 @@ const { autotaskClient } = require('../utils/autotask');
  */
 router.get('/summary', async (req, res, next) => {
   try {
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-
     const response = await autotaskClient.post('/Tickets/query', {
       filter: [
         {
-          field: 'CreateDate',
-          op: 'gte',
-          value: twelveMonthsAgo.toISOString()
+          field: 'id',
+          op: 'gt',
+          value: 0
         }
-      ],
-      includeFields: ['id', 'CreateDate', 'Status', 'AssignedResourceID', 'TicketCategory']
+      ]
     });
+
+    res.json({ total: response.data.items?.length || 0, raw: response.data });
+  } catch (err) {
+    next(err);
+  }
+});
 
     const tickets = response.data.items || [];
 
