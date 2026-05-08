@@ -95,4 +95,20 @@ router.get('/all', async (req, res, next) => {
   }
 });
 
+if (summaryRes.data.items?.length > 0) {
+  const sample = summaryRes.data.items[0];
+  console.log('[Sample ticket]', JSON.stringify({
+    createDate: sample.createDate,
+    issueType: sample.issueType,
+    firstResponseDueDateTime: sample.firstResponseDueDateTime,
+    firstResponseDateTime: sample.firstResponseDateTime,
+    queueID: sample.queueID
+  }));
+  console.log('[Date range]', {
+    oldest: summaryRes.data.items.reduce((min, t) => t.createDate < min ? t.createDate : min, summaryRes.data.items[0].createDate),
+    newest: summaryRes.data.items.reduce((max, t) => t.createDate > max ? t.createDate : max, summaryRes.data.items[0].createDate),
+    total: summaryRes.data.items.length
+  });
+}
+
 module.exports = router;
