@@ -35,13 +35,13 @@ app.get('/health', (req, res) => {
 });
 
 // Temporary public route to fetch queue IDs
-app.get('/statuses', async (req, res) => {
+app.get('/techlist', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
-    const fields = response.data.fields || [];
-    const statusField = fields.find(f => f.name === 'status');
-    res.json({ statuses: statusField?.picklistValues || [] });
+    const response = await autotaskClient.post('/Resources/query', {
+      filter: [{ field: 'isActive', op: 'eq', value: true }]
+    });
+    res.json({ resources: response.data.items || [] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
