@@ -17,17 +17,21 @@ const autotaskClient = {
 };
 
 // Temporary debug interceptor
-axios.interceptors.request.use(request => {
-  if (request.url && request.url.includes('autotask')) {
-    console.log('[AutoTask Request URL]', request.url);
-    console.log('[AutoTask Headers]', JSON.stringify({
-      UserName: request.headers['UserName'] || request.headers['username'],
-      SecretLength: (request.headers['Secret'] || request.headers['secret'])?.length,
-      ApiIntegrationCode: request.headers['ApiIntegrationCode'] || request.headers['apiintegrationcode']
-    }));
+axios.interceptors.response.use(
+  response => response,
+  error => {
+    if (error.response?.status === 429) {
+      console.log('[429 Response Body]', JSON.stringify(error.response.data));
+    }
+    if (error.response?.status === 500) {
+      console.log('[500 Response Body]', JSON.stringify(error.response.data));
+      console.log('[500 Request URL]', error.config?.url);
+      console.log('[500 Request Method]', error.config?.method);
+      console.log('[500 Request Body]', error.config?.data);
+    }
+    return Promise.reject(error);
   }
-  return request;
-});
+);
 
 axios.interceptors.response.use(
   response => response,
