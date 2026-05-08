@@ -35,13 +35,30 @@ app.get('/health', (req, res) => {
 });
 
 // Temporary public route to fetch queue IDs
-app.get('/techlist', async (req, res) => {
+app.get('/slafields', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.post('/Resources/query', {
-      filter: [{ field: 'isActive', op: 'eq', value: true }]
-    });
-    res.json({ resources: response.data.items || [] });
+    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
+    const fields = response.data.fields || [];
+    const slaFields = fields.filter(f => f.name.toLowerCase().includes('sla') || 
+      f.name.toLowerCase().includes('response') || 
+      f.name.toLowerCase().includes('first'));
+    res.json({ slaFields });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/issuefields', async (req, res) => {
+  try {
+    const { autotaskClient } = require('./utils/autotask');
+    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
+    const fields = response.data.fields || [];
+    const issueFields = fields.filter(f => 
+      f.name.toLowerCase().includes('issue') || 
+      f.name.toLowerCase().includes('subissue')
+    );
+    res.json({ issueFields });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
