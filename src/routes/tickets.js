@@ -5,16 +5,10 @@ const { autotaskClient } = require('../utils/autotask');
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
-const EXCLUDE_STATUSES = [5, 20]; // Complete, RMM Resolved
+const EXCLUDE_STATUSES = [5, 20];
 const EXCLUDE_RESOURCES = [
-  29682885, // Matt Canavan
-  29682893, // Joe Lozier
-  29682894, // Carissa Malone
-  29682895, // Mark Lamson
-  29682902, // Matt Woodring
-  29682926, // Avery Sellers
-  29682928, // Ali Sellers
-  29682936  // Brian Robinson
+  29682885, 29682893, 29682894, 29682895,
+  29682902, 29682926, 29682928, 29682936
 ];
 
 router.get('/all', async (req, res, next) => {
@@ -28,13 +22,14 @@ router.get('/all', async (req, res, next) => {
       }))
     };
 
-    // All tickets in valid queues for volume trend
+    console.log('[Tickets] Fetching summary...');
     const summaryRes = await autotaskClient.post('/Tickets/query', {
       filter: [queueFilter]
     });
+    console.log('[Tickets] Summary done, count:', summaryRes.data.items?.length);
     await sleep(500);
 
-    // Open tickets excluding RMM Resolved and Complete
+    console.log('[Tickets] Fetching open...');
     const openRes = await autotaskClient.post('/Tickets/query', {
       filter: [
         queueFilter,
@@ -48,27 +43,31 @@ router.get('/all', async (req, res, next) => {
         }
       ]
     });
+    console.log('[Tickets] Open done, count:', openRes.data.items?.length);
     await sleep(500);
 
-    // Completed tickets with a completedDate for avg resolution time
-    // Exclude tickets with no hours (hoursToBeScheduled is null and status is complete)
-    const completedRes = await autotaskClient.post('/Tickets/query', {
-      filter: [
-        queueFilter,
-        { field: 'status', op: 'eq', value: 5 },
-        { field: 'completedDate', op: 'exist' }
-      ]
-    });
-
-    // Filter out tickets with no work done (hoursToBeScheduled null)
-    const completedWithWork = (completedRes.data.items || []).filter(
-      t => t.hoursToBeScheduled !== null && t.hoursToBeScheduled > 0
-    );
+    console.log('[Tickets] Fetching completed...');
+    let completedItems = [];
+    try {
+      const completedRes = await autotaskClient.post('/Tickets/query', {
+        filter: [
+          queueFilter,
+          { field: 'status', op: 'eq', value: 5 },
+          { field: 'completedDate', op: 'exist' }
+        ]
+      });
+      completedItems = (completedRes.data.items || []).filter(
+        t => t.hoursToBeScheduled !== null && t.hoursToBeScheduled > 0
+      );
+      console.log('[Tickets] Completed done, count:', completedItems.length);
+    } catch (completedErr) {
+      console.log('[Tickets] Completed query failed:', completedErr.message);
+    }
 
     res.json({
       summary: { items: summaryRes.data.items || [] },
       open: { items: openRes.data.items || [] },
-      completed: { items: completedWithWork },
+      completed: { items: completedItems },
       excludeResources: EXCLUDE_RESOURCES
     });
   } catch (err) {
