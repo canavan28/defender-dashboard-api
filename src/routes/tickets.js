@@ -12,13 +12,33 @@ const EXCLUDE_RESOURCES = [
 ];
 
 const ISSUE_TYPE_MAP = {
-  6: 'InfoTank Services', 7: 'Server', 10: 'Computer', 11: 'Network',
-  13: 'Maintenance', 16: 'Other', 17: 'Quote', 18: 'RMM Monitoring',
-  19: 'Web Development', 20: 'Email', 21: 'User Management',
-  22: 'Net User Change', 23: 'New Device Setup', 24: 'Mobile Device Mgmt',
-  26: 'Leased Item Install', 27: 'HSCC Daily Onsite', 28: 'Microsoft',
-  29: 'Software', 30: 'Printing/Scanning'
+  '6': 'InfoTank Services', '7': 'Server', '10': 'Computer', '11': 'Network',
+  '13': 'Maintenance', '16': 'Other', '17': 'Quote', '18': 'RMM Monitoring',
+  '19': 'Web Development', '20': 'Email', '21': 'User Management',
+  '22': 'Net User Change', '23': 'New Device Setup', '24': 'Mobile Device Mgmt',
+  '26': 'Leased Item Install', '27': 'HSCC Daily Onsite', '28': 'Microsoft',
+  '29': 'Software', '30': 'Printing/Scanning'
 };
+
+async function queryAllTickets(filter) {
+  let allItems = [];
+  let nextPage = null;
+
+  do {
+    const url = nextPage ? nextPage : '/Tickets/query';
+    const response = nextPage
+      ? await autotaskClient.get(nextPage.replace('/ATServicesRest/v1.0', ''))
+      : await autotaskClient.post(url, { filter, maxRecords: 500 });
+
+    const items = response.data.items || [];
+    allItems = [...allItems, ...items];
+    nextPage = response.data.pageDetails?.nextPageUrl || null;
+
+    if (nextPage) await sleep(300);
+  } while (nextPage);
+
+  return allItems;
+}
 
 router.get('/all', async (req, res, next) => {
   try {
@@ -35,73 +55,45 @@ router.get('/all', async (req, res, next) => {
     twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
 
     console.log('[Tickets] Fetching summary...');
-    const summaryRes = await autotaskClient.post('/Tickets/query', {
-      filter: [
-        queueFilter,
-        { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
-      ]
-    });
-    console.log('[Tickets] Summary done, count:', summaryRes.data.items?.length);
-
-    // Debug sample ticket
-    if (summaryRes.data.items?.length > 0) {
-      const sample = summaryRes.data.items[0];
-      console.log('[Sample ticket]', JSON.stringify({
-        createDate: sample.createDate,
-        issueType: sample.issueType,
-        firstResponseDueDateTime: sample.firstResponseDueDateTime,
-        firstResponseDateTime: sample.firstResponseDateTime,
-        queueID: sample.queueID
-      }));
-      const dates = summaryRes.data.items.map(t => t.createDate).filter(Boolean).sort();
-      console.log('[Date range]', {
-        oldest: dates[0],
-        newest: dates[dates.length - 1],
-        total: summaryRes.data.items.length
-      });
-    }
-
+    const summaryItems = await queryAllTickets([
+      queueFilter,
+      { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
+    ]);
+    console.log('[Tickets] Summary done, count:', summaryItems.length);
     await sleep(500);
 
     console.log('[Tickets] Fetching open...');
-    const openRes = await autotaskClient.post('/Tickets/query', {
-      filter: [
-        queueFilter,
-        {
-          op: 'and',
-          items: EXCLUDE_STATUSES.map(id => ({
-            field: 'status',
-            op: 'noteq',
-            value: id
-          }))
-        }
-      ]
-    });
-    console.log('[Tickets] Open done, count:', openRes.data.items?.length);
+    const openItems = await queryAllTickets([
+      queueFilter,
+      {
+        op: 'and',
+        items: EXCLUDE_STATUSES.map(id => ({
+          field: 'status',
+          op: 'noteq',
+          value: id
+        }))
+      }
+    ]);
+    console.log('[Tickets] Open done, count:', openItems.length);
     await sleep(500);
 
     console.log('[Tickets] Fetching completed...');
     let completedItems = [];
     try {
-      const completedRes = await autotaskClient.post('/Tickets/query', {
-        filter: [
-          queueFilter,
-          { field: 'status', op: 'eq', value: 5 },
-          { field: 'completedDate', op: 'exist' },
-          { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
-        ]
-      });
-      completedItems = (completedRes.data.items || []).filter(
-        t => t.hoursToBeScheduled !== null && t.hoursToBeScheduled > 0
-      );
+      completedItems = await queryAllTickets([
+        queueFilter,
+        { field: 'status', op: 'eq', value: 5 },
+        { field: 'completedDate', op: 'exist' },
+        { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
+      ]);
       console.log('[Tickets] Completed done, count:', completedItems.length);
     } catch (completedErr) {
       console.log('[Tickets] Completed query failed:', completedErr.message);
     }
 
     res.json({
-      summary: { items: summaryRes.data.items || [] },
-      open: { items: openRes.data.items || [] },
+      summary: { items: summaryItems },
+      open: { items: openItems },
       completed: { items: completedItems },
       excludeResources: EXCLUDE_RESOURCES,
       issueTypeMap: ISSUE_TYPE_MAP
