@@ -35,5 +35,14 @@ router.get('/all', async (req, res, next) => {
     next(err);
   }
 });
-
+router.get('/queues', async (req, res, next) => {
+  try {
+    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
+    const fields = response.data.fields || [];
+    const queueField = fields.find(f => f.name === 'queueID');
+    res.json({ queues: queueField?.picklistValues || [] });
+  } catch (err) {
+    next(err);
+  }
+});
 module.exports = router;
