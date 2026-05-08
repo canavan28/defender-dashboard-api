@@ -11,6 +11,15 @@ const EXCLUDE_RESOURCES = [
   29682902, 29682926, 29682928, 29682936
 ];
 
+const ISSUE_TYPE_MAP = {
+  6: 'InfoTank Services', 7: 'Server', 10: 'Computer', 11: 'Network',
+  13: 'Maintenance', 16: 'Other', 17: 'Quote', 18: 'RMM Monitoring',
+  19: 'Web Development', 20: 'Email', 21: 'User Management',
+  22: 'Net User Change', 23: 'New Device Setup', 24: 'Mobile Device Mgmt',
+  26: 'Leased Item Install', 27: 'HSCC Daily Onsite', 28: 'Microsoft',
+  29: 'Software', 30: 'Printing/Scanning'
+};
+
 router.get('/all', async (req, res, next) => {
   try {
     const queueFilter = {
@@ -22,13 +31,21 @@ router.get('/all', async (req, res, next) => {
       }))
     };
 
+    // All tickets for volume trend (12 months)
+    const twelveMonthsAgo = new Date();
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+
     console.log('[Tickets] Fetching summary...');
     const summaryRes = await autotaskClient.post('/Tickets/query', {
-      filter: [queueFilter]
+      filter: [
+        queueFilter,
+        { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
+      ]
     });
     console.log('[Tickets] Summary done, count:', summaryRes.data.items?.length);
     await sleep(500);
 
+    // Open tickets
     console.log('[Tickets] Fetching open...');
     const openRes = await autotaskClient.post('/Tickets/query', {
       filter: [
@@ -46,6 +63,7 @@ router.get('/all', async (req, res, next) => {
     console.log('[Tickets] Open done, count:', openRes.data.items?.length);
     await sleep(500);
 
+    // Completed tickets with SLA data (last 12 months)
     console.log('[Tickets] Fetching completed...');
     let completedItems = [];
     try {
@@ -53,7 +71,8 @@ router.get('/all', async (req, res, next) => {
         filter: [
           queueFilter,
           { field: 'status', op: 'eq', value: 5 },
-          { field: 'completedDate', op: 'exist' }
+          { field: 'completedDate', op: 'exist' },
+          { field: 'createDate', op: 'gte', value: twelveMonthsAgo.toISOString() }
         ]
       });
       completedItems = (completedRes.data.items || []).filter(
@@ -68,7 +87,8 @@ router.get('/all', async (req, res, next) => {
       summary: { items: summaryRes.data.items || [] },
       open: { items: openRes.data.items || [] },
       completed: { items: completedItems },
-      excludeResources: EXCLUDE_RESOURCES
+      excludeResources: EXCLUDE_RESOURCES,
+      issueTypeMap: ISSUE_TYPE_MAP
     });
   } catch (err) {
     next(err);
