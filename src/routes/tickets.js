@@ -28,7 +28,7 @@ async function queryAllTickets(filter) {
   do {
     let response;
     if (nextPageUrl) {
-      response = await axios.get(nextPageUrl, { headers: getHeaders() });
+      response = await axios.post(nextPageUrl, {}, { headers: getHeaders() });
     } else {
       response = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
     }
