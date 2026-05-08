@@ -30,10 +30,14 @@ async function queryAllTickets(filter) {
   allItems = [...(firstResponse.data.items || [])];
   nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
 
-  // Subsequent pages
+  // Subsequent pages — pass original filter in body
   while (nextPageUrl) {
     await sleep(300);
-    const response = await axios.post(nextPageUrl, undefined, { headers: getHeaders() });
+    const response = await axios.post(
+      nextPageUrl,
+      { filter, maxRecords: 500 },
+      { headers: getHeaders() }
+    );
     allItems = [...allItems, ...(response.data.items || [])];
     nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
   }
