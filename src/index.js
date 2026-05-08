@@ -34,6 +34,9 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Temporary public route to fetch queue IDs
+app.use('/api/tickets/queues', ticketsRouter);
+
 // ── Protected routes ──────────────────────────────────────────────────────────
 app.use('/api', verifyApiKey);
 app.use('/api/tickets', ticketsRouter);
