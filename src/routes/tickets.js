@@ -31,7 +31,6 @@ router.get('/all', async (req, res, next) => {
       }))
     };
 
-    // All tickets for volume trend (12 months)
     const twelveMonthsAgo = new Date();
     twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
 
@@ -43,9 +42,27 @@ router.get('/all', async (req, res, next) => {
       ]
     });
     console.log('[Tickets] Summary done, count:', summaryRes.data.items?.length);
+
+    // Debug sample ticket
+    if (summaryRes.data.items?.length > 0) {
+      const sample = summaryRes.data.items[0];
+      console.log('[Sample ticket]', JSON.stringify({
+        createDate: sample.createDate,
+        issueType: sample.issueType,
+        firstResponseDueDateTime: sample.firstResponseDueDateTime,
+        firstResponseDateTime: sample.firstResponseDateTime,
+        queueID: sample.queueID
+      }));
+      const dates = summaryRes.data.items.map(t => t.createDate).filter(Boolean).sort();
+      console.log('[Date range]', {
+        oldest: dates[0],
+        newest: dates[dates.length - 1],
+        total: summaryRes.data.items.length
+      });
+    }
+
     await sleep(500);
 
-    // Open tickets
     console.log('[Tickets] Fetching open...');
     const openRes = await autotaskClient.post('/Tickets/query', {
       filter: [
@@ -63,7 +80,6 @@ router.get('/all', async (req, res, next) => {
     console.log('[Tickets] Open done, count:', openRes.data.items?.length);
     await sleep(500);
 
-    // Completed tickets with SLA data (last 12 months)
     console.log('[Tickets] Fetching completed...');
     let completedItems = [];
     try {
@@ -94,21 +110,5 @@ router.get('/all', async (req, res, next) => {
     next(err);
   }
 });
-
-if (summaryRes.data.items?.length > 0) {
-  const sample = summaryRes.data.items[0];
-  console.log('[Sample ticket]', JSON.stringify({
-    createDate: sample.createDate,
-    issueType: sample.issueType,
-    firstResponseDueDateTime: sample.firstResponseDueDateTime,
-    firstResponseDateTime: sample.firstResponseDateTime,
-    queueID: sample.queueID
-  }));
-  console.log('[Date range]', {
-    oldest: summaryRes.data.items.reduce((min, t) => t.createDate < min ? t.createDate : min, summaryRes.data.items[0].createDate),
-    newest: summaryRes.data.items.reduce((max, t) => t.createDate > max ? t.createDate : max, summaryRes.data.items[0].createDate),
-    total: summaryRes.data.items.length
-  });
-}
 
 module.exports = router;
