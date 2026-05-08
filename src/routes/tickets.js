@@ -9,6 +9,12 @@ router.get('/all', async (req, res, next) => {
     const summaryRes = await autotaskClient.post('/Tickets/query', {
       filter: [{ field: 'id', op: 'gt', value: 0 }]
     });
+
+    // Temporary - log first ticket to see field names
+    if (summaryRes.data.items?.length > 0) {
+      console.log('[Ticket Fields]', JSON.stringify(summaryRes.data.items[0]));
+    }
+
     await sleep(500);
 
     const openRes = await autotaskClient.post('/Tickets/query', {
