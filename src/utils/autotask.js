@@ -28,15 +28,15 @@ axios.interceptors.request.use(request => {
   }
   return request;
 });
-// Response interceptor to log 429 details
+
 axios.interceptors.response.use(
   response => response,
   error => {
     if (error.response?.status === 429) {
       console.log('[429 Response Body]', JSON.stringify(error.response.data));
-      console.log('[429 Response Headers]', JSON.stringify(error.response.headers));
     }
     return Promise.reject(error);
   }
 );
-module.exports = { autotaskClient };
+
+module.exports = { autotaskClient, getHeaders };

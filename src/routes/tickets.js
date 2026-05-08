@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { autotaskClient } = require('../utils/autotask');
+const axios = require('axios');
+const { autotaskClient, getHeaders } = require('../utils/autotask');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -22,20 +23,22 @@ const ISSUE_TYPE_MAP = {
 
 async function queryAllTickets(filter) {
   let allItems = [];
-  let nextPage = null;
+  let nextPageUrl = null;
 
   do {
-    const url = nextPage ? nextPage : '/Tickets/query';
-    const response = nextPage
-      ? await autotaskClient.get(nextPage.replace('/ATServicesRest/v1.0', ''))
-      : await autotaskClient.post(url, { filter, maxRecords: 500 });
+    let response;
+    if (nextPageUrl) {
+      response = await axios.get(nextPageUrl, { headers: getHeaders() });
+    } else {
+      response = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
+    }
 
     const items = response.data.items || [];
     allItems = [...allItems, ...items];
-    nextPage = response.data.pageDetails?.nextPageUrl || null;
+    nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
 
-    if (nextPage) await sleep(300);
-  } while (nextPage);
+    if (nextPageUrl) await sleep(300);
+  } while (nextPageUrl);
 
   return allItems;
 }
