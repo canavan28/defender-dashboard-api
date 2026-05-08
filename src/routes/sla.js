@@ -2,11 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { autotaskClient } = require('../utils/autotask');
 
-/**
- * GET /api/sla/compliance
- * Returns SLA breach rate for the last 6 months vs prior 6 months.
- * Used by: SLA Health module and Staffing Signals card
- */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 router.get('/compliance', async (req, res, next) => {
   try {
     const now = new Date();
@@ -15,28 +12,22 @@ router.get('/compliance', async (req, res, next) => {
     const twelveMonthsAgo = new Date();
     twelveMonthsAgo.setMonth(now.getMonth() - 12);
 
-    // Current period
     const currentRes = await autotaskClient.post('/Tickets/query', {
       filter: [
-        { field: 'CreateDate', op: 'gte', value: sixMonthsAgo.toISOString() },
-        { field: 'Status', op: 'eq', value: 5 } // completed tickets only for SLA calc
-      ],
-      includeFields: ['id', 'ServiceLevelAgreementHasBeenMet']
+        { field: 'id', op: 'gt', value: 0 }
+      ]
     });
+    await sleep(500);
 
-    // Prior period
     const priorRes = await autotaskClient.post('/Tickets/query', {
       filter: [
-        { field: 'CreateDate', op: 'gte', value: twelveMonthsAgo.toISOString() },
-        { field: 'CreateDate', op: 'lt', value: sixMonthsAgo.toISOString() },
-        { field: 'Status', op: 'eq', value: 5 }
-      ],
-      includeFields: ['id', 'ServiceLevelAgreementHasBeenMet']
+        { field: 'id', op: 'gt', value: 0 }
+      ]
     });
 
     const calcBreachRate = (tickets) => {
       if (!tickets.length) return 0;
-      const breached = tickets.filter(t => t.ServiceLevelAgreementHasBeenMet === false).length;
+      const breached = tickets.filter(t => t.serviceLevelAgreementHasBeenMet === false).length;
       return parseFloat(((breached / tickets.length) * 100).toFixed(1));
     };
 
@@ -44,14 +35,8 @@ router.get('/compliance', async (req, res, next) => {
     const priorTickets = priorRes.data.items || [];
 
     res.json({
-      current: {
-        total: currentTickets.length,
-        breachRate: calcBreachRate(currentTickets)
-      },
-      prior: {
-        total: priorTickets.length,
-        breachRate: calcBreachRate(priorTickets)
-      }
+      current: { total: currentTickets.length, breachRate: calcBreachRate(currentTickets) },
+      prior: { total: priorTickets.length, breachRate: calcBreachRate(priorTickets) }
     });
   } catch (err) {
     next(err);
