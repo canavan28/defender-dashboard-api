@@ -25,20 +25,18 @@ async function queryAllTickets(filter) {
   let allItems = [];
   let nextPageUrl = null;
 
-  do {
-    let response;
-    if (nextPageUrl) {
-      response = await axios.post(nextPageUrl, {}, { headers: getHeaders() });
-    } else {
-      response = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
-    }
+  // First page
+  const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
+  allItems = [...(firstResponse.data.items || [])];
+  nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
 
-    const items = response.data.items || [];
-    allItems = [...allItems, ...items];
+  // Subsequent pages — use GET on the full nextPageUrl as-is
+  while (nextPageUrl) {
+    await sleep(300);
+    const response = await axios.get(nextPageUrl, { headers: getHeaders() });
+    allItems = [...allItems, ...(response.data.items || [])];
     nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
-
-    if (nextPageUrl) await sleep(300);
-  } while (nextPageUrl);
+  }
 
   return allItems;
 }
