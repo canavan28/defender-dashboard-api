@@ -24,13 +24,14 @@ const ISSUE_TYPE_MAP = {
 async function queryAllTickets(filter) {
   let allItems = [];
   let nextPageUrl = null;
+  let pageCount = 0;
 
-  // First page
   const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
   allItems = [...(firstResponse.data.items || [])];
   nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+  pageCount++;
+  console.log(`[Pagination] Page ${pageCount}, items: ${allItems.length}, hasNext: ${!!nextPageUrl}`);
 
-  // Subsequent pages — pass original filter in body
   while (nextPageUrl) {
     await sleep(300);
     const response = await axios.post(
@@ -40,6 +41,8 @@ async function queryAllTickets(filter) {
     );
     allItems = [...allItems, ...(response.data.items || [])];
     nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+    pageCount++;
+    console.log(`[Pagination] Page ${pageCount}, items: ${allItems.length}, hasNext: ${!!nextPageUrl}`);
   }
 
   return allItems;
