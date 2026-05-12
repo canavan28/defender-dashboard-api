@@ -86,7 +86,7 @@ async function fetchHistorical() {
   const allTickets = await queryAllTickets([
     queueFilter,
     { field: 'createDate', op: 'gte', value: twentyFourMonthsAgo.toISOString() },
-    { field: 'createDate', op: 'lt', value: thirtyDaysAgo.toISOString() }
+    { field: 'createDate', op: 'lt', value: thirtyDaysAgo.toISOString() },
     { field: 'status', op: 'noteq', value: 20 }
   ]);
   await sleep(500);
