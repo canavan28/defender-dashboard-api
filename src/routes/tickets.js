@@ -69,6 +69,8 @@ router.get('/all', async (req, res, next) => {
     ]);
     console.log('[Tickets] Summary done, count:', summaryItems.length);
     await sleep(500);
+    const aprilTickets = summaryItems.filter(t => t.createDate?.startsWith('2026-04'));
+    console.log('[April 2026 count]', aprilTickets.length);
 
     console.log('[Tickets] Fetching open...');
     const openItems = await queryAllTickets([
