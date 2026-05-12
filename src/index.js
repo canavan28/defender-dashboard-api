@@ -1,21 +1,16 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-
 const ticketsRouter = require('./routes/tickets');
-const resourcesRouter = require('./routes/resources');
-const slaRouter = require('./routes/sla');
 const { verifyApiKey } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim());
 
 app.use(cors({
   origin: (origin, callback) => {
-    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim());
     if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
@@ -23,54 +18,47 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
-
-// Handle preflight requests explicitly
 app.options('*', cors());
-
 app.use(express.json());
 
-// ── Health check (no auth required) ──────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Temporary public route to fetch queue IDs
-app.get('/slafields', async (req, res) => {
+// Temporary lookup routes
+app.get('/queues', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
     const response = await autotaskClient.get('/Tickets/entityInformation/fields');
     const fields = response.data.fields || [];
-    const slaFields = fields.filter(f => f.name.toLowerCase().includes('sla') || 
-      f.name.toLowerCase().includes('response') || 
-      f.name.toLowerCase().includes('first'));
-    res.json({ slaFields });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const queueField = fields.find(f => f.name === 'queueID');
+    res.json({ queues: queueField?.picklistValues || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/issuefields', async (req, res) => {
+app.get('/statuses', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
     const response = await autotaskClient.get('/Tickets/entityInformation/fields');
     const fields = response.data.fields || [];
-    const issueFields = fields.filter(f => 
-      f.name.toLowerCase().includes('issue') || 
-      f.name.toLowerCase().includes('subissue')
-    );
-    res.json({ issueFields });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const statusField = fields.find(f => f.name === 'status');
+    res.json({ statuses: statusField?.picklistValues || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Protected routes ──────────────────────────────────────────────────────────
+app.get('/techlist', async (req, res) => {
+  try {
+    const { autotaskClient } = require('./utils/autotask');
+    const response = await autotaskClient.post('/Resources/query', {
+      filter: [{ field: 'isActive', op: 'eq', value: true }]
+    });
+    res.json({ resources: response.data.items || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.use('/api', verifyApiKey);
 app.use('/api/tickets', ticketsRouter);
-app.use('/api/resources', resourcesRouter);
-app.use('/api/sla', slaRouter);
 
-// ── Error handler ─────────────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('[Error]', err.message);
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
