@@ -60,7 +60,7 @@ router.get('/all', async (req, res, next) => {
     };
 
     const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
+    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 24);
 
     console.log('[Tickets] Fetching summary...');
     const summaryItems = await queryAllTickets([
