@@ -36,6 +36,16 @@ app.get('/queues', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/timeentryfields', async (req, res) => {
+  try {
+    const { autotaskClient } = require('./utils/autotask');
+    const response = await autotaskClient.get('/TimeEntries/entityInformation/fields');
+    res.json({ fields: response.data.fields || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/statuses', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
