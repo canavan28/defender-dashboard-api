@@ -43,7 +43,8 @@ app.get('/timeentrycount', async (req, res) => {
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
     const response = await autotaskClient.post('/TimeEntries/query', {
       filter: [
-        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() }
+        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
+        { field: 'ticketID', op: 'exist' }
       ],
       maxRecords: 3
     });
@@ -54,7 +55,8 @@ app.get('/timeentrycount', async (req, res) => {
         ticketID: t.ticketID,
         hoursWorked: t.hoursWorked,
         dateWorked: t.dateWorked,
-        resourceID: t.resourceID
+        resourceID: t.resourceID,
+        summaryNotes: t.summaryNotes?.substring(0, 100)
       }))
     });
   } catch (err) {
