@@ -39,27 +39,35 @@ app.get('/queues', async (req, res) => {
 app.get('/timeentrycount', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
+    const axios = require('axios');
+    const { getHeaders } = require('./utils/autotask');
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-    
-    // Get first page with max records to estimate total
-    const response = await autotaskClient.post('/TimeEntries/query', {
-      filter: [
-        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
-        { field: 'ticketID', op: 'exist' }
-      ],
-      maxRecords: 500
-    });
 
-    res.json({ 
-      firstPageCount: response.data.items?.length,
-      hasMorePages: !!response.data.pageDetails?.nextPageUrl,
-      pageDetails: response.data.pageDetails,
-      typeBreakdown: response.data.items?.reduce((acc, t) => {
-        acc[t.timeEntryType] = (acc[t.timeEntryType] || 0) + 1;
-        return acc;
-      }, {})
+    const filter = [
+      { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
+      { field: 'ticketID', op: 'exist' }
+    ];
+
+    let totalCount = 0;
+    let pageCount = 0;
+    let nextPageUrl = null;
+
+    const firstResponse = await autotaskClient.post('/TimeEntries/query', {
+      filter, maxRecords: 500
     });
+    totalCount += firstResponse.data.items?.length || 0;
+    nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+    pageCount++;
+
+    while (nextPageUrl) {
+      const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+      totalCount += response.data.items?.length || 0;
+      nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      pageCount++;
+    }
+
+    res.json({ totalCount, pageCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
