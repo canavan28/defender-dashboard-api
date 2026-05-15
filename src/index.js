@@ -41,23 +41,24 @@ app.get('/timeentrycount', async (req, res) => {
     const { autotaskClient } = require('./utils/autotask');
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    
+    // Get first page with max records to estimate total
     const response = await autotaskClient.post('/TimeEntries/query', {
       filter: [
         { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
         { field: 'ticketID', op: 'exist' }
       ],
-      maxRecords: 3
+      maxRecords: 500
     });
+
     res.json({ 
+      firstPageCount: response.data.items?.length,
+      hasMorePages: !!response.data.pageDetails?.nextPageUrl,
       pageDetails: response.data.pageDetails,
-      samples: response.data.items?.map(t => ({
-        timeEntryType: t.timeEntryType,
-        ticketID: t.ticketID,
-        hoursWorked: t.hoursWorked,
-        dateWorked: t.dateWorked,
-        resourceID: t.resourceID,
-        summaryNotes: t.summaryNotes?.substring(0, 100)
-      }))
+      typeBreakdown: response.data.items?.reduce((acc, t) => {
+        acc[t.timeEntryType] = (acc[t.timeEntryType] || 0) + 1;
+        return acc;
+      }, {})
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
