@@ -12,6 +12,8 @@ const EXCLUDE_RESOURCES = [
   29682885, 29682893, 29682894, 29682895,
   29682902, 29682926, 29682928, 29682936
 ];
+const EXCLUDE_RESOURCES_SET = new Set(EXCLUDE_RESOURCES);
+
 const ISSUE_TYPE_MAP = {
   '6': 'InfoTank Services', '7': 'Server', '10': 'Computer', '11': 'Network',
   '13': 'Maintenance', '16': 'Other', '17': 'Quote', '18': 'RMM Monitoring',
@@ -20,7 +22,6 @@ const ISSUE_TYPE_MAP = {
   '26': 'Leased Item Install', '27': 'HSCC Daily Onsite', '28': 'Microsoft',
   '29': 'Software', '30': 'Printing/Scanning'
 };
-const EXCLUDE_RESOURCES_SET = new Set(EXCLUDE_RESOURCES);
 
 const SUB_ISSUE_MAP = {
   '104': { label: 'Application', parent: '10' },
@@ -149,11 +150,13 @@ const SUB_ISSUE_MAP = {
   '295': { label: 'Printer Offline', parent: '30' }
 };
 
-// ── Cache ────────────────────────────────────────────────────────────────────
-let historicalCache = null; // tickets older than 30 days
-let recentCache = null;     // tickets last 30 days
+// ── Caches ───────────────────────────────────────────────────────────────────
+let historicalCache = null;
+let recentCache = null;
+let historicalTimeEntryCache = null;
+let recentTimeEntryCache = null;
 
-// ── Pagination helper ────────────────────────────────────────────────────────
+// ── Pagination helpers ────────────────────────────────────────────────────────
 async function queryAllTickets(filter) {
   let allItems = [];
   let nextPageUrl = null;
@@ -177,15 +180,74 @@ async function queryAllTickets(filter) {
   return allItems;
 }
 
-// ── Merge helper (recent wins on duplicate IDs) ───────────────────────────────
+async function queryAllEntries(path, filter) {
+  let allItems = [];
+  let nextPageUrl = null;
+  let pageCount = 0;
+
+  const firstResponse = await autotaskClient.post(path, { filter, maxRecords: 500 });
+  allItems = [...(firstResponse.data.items || [])];
+  nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+  pageCount++;
+
+  while (nextPageUrl) {
+    await sleep(300);
+    const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+    allItems = [...allItems, ...(response.data.items || [])];
+    nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+    pageCount++;
+  }
+
+  console.log(`[Pagination] ${path} complete: ${pageCount} pages, ${allItems.length} items`);
+  return allItems;
+}
+
+// ── Merge helper ──────────────────────────────────────────────────────────────
 function mergeTickets(historical, recent) {
   const map = {};
   (historical || []).forEach(t => { map[t.id] = t; });
-  (recent || []).forEach(t => { map[t.id] = t; }); // recent overwrites
+  (recent || []).forEach(t => { map[t.id] = t; });
   return Object.values(map);
 }
 
-// ── Fetch resources ───────────────────────────────────────────────────────────
+// ── Build merged response payload ─────────────────────────────────────────────
+function buildPayload(resources) {
+  const allTickets = mergeTickets(
+    historicalCache?.allTickets,
+    recentCache?.allTickets
+  );
+  const completedTickets = mergeTickets(
+    historicalCache?.completedTickets,
+    recentCache?.completedTickets
+  );
+  const openTickets = recentCache?.openTickets || [];
+
+  const timeEntryMap = {};
+  [...(historicalTimeEntryCache?.items || []), ...(recentTimeEntryCache?.items || [])].forEach(t => {
+    timeEntryMap[t.id] = t;
+  });
+  const timeEntries = Object.values(timeEntryMap);
+
+  return {
+    allTickets,
+    completedTickets,
+    openTickets,
+    timeEntries,
+    resources,
+    excludeResources: EXCLUDE_RESOURCES,
+    issueTypeMap: ISSUE_TYPE_MAP,
+    subIssueMap: SUB_ISSUE_MAP,
+    cacheInfo: {
+      historicalBuiltAt: historicalCache?.builtAt,
+      recentBuiltAt: recentCache?.builtAt,
+      timeEntriesBuiltAt: recentTimeEntryCache?.builtAt,
+      totalTickets: allTickets.length,
+      totalTimeEntries: timeEntries.length
+    }
+  };
+}
+
+// ── Resources ─────────────────────────────────────────────────────────────────
 async function fetchResources() {
   const response = await autotaskClient.post('/Resources/query', {
     filter: [{ field: 'isActive', op: 'eq', value: true }]
@@ -197,58 +259,15 @@ async function fetchResources() {
   }));
 }
 
-// ── Fetch historical time entries (6mo to 30 days ago) ────────────────────
-async function fetchHistoricalTimeEntries(ticketIDSet) {
-  console.log('[TimeEntries] Building historical cache...');
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-  const items = await queryAllEntries('/TimeEntries/query', [
-    { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
-    { field: 'dateWorked', op: 'lt', value: thirtyDaysAgo.toISOString() },
-    { field: 'ticketID', op: 'exist' }
-  ]);
-
-  const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
-    ticketIDSet.has(t.ticketID)
-  );
-
-  console.log(`[TimeEntries] Historical: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date() };
-}
-
-// ── Fetch recent time entries (last 30 days) ──────────────────────────────
-async function fetchRecentTimeEntries(ticketIDSet) {
-  console.log('[TimeEntries] Refreshing recent cache...');
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-  const items = await queryAllEntries('/TimeEntries/query', [
-    { field: 'dateWorked', op: 'gte', value: thirtyDaysAgo.toISOString() },
-    { field: 'ticketID', op: 'exist' }
-  ]);
-
-  const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
-    ticketIDSet.has(t.ticketID)
-  );
-
-  console.log(`[TimeEntries] Recent: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date() };
-}
-
-// ── Build queue filter ────────────────────────────────────────────────────────
+// ── Queue filter ──────────────────────────────────────────────────────────────
 const queueFilter = {
   op: 'or',
   items: INCLUDE_QUEUES.map(id => ({ field: 'queueID', op: 'eq', value: id }))
 };
 
-// ── Fetch historical data (24mo to 30 days ago) ───────────────────────────────
+// ── Ticket fetchers ───────────────────────────────────────────────────────────
 async function fetchHistorical() {
-  console.log('[Cache] Building historical cache...');
+  console.log('[Cache] Building historical ticket cache...');
   const twentyFourMonthsAgo = new Date();
   twentyFourMonthsAgo.setMonth(twentyFourMonthsAgo.getMonth() - 24);
   const thirtyDaysAgo = new Date();
@@ -270,13 +289,12 @@ async function fetchHistorical() {
     { field: 'createDate', op: 'lt', value: thirtyDaysAgo.toISOString() }
   ]);
 
-  console.log(`[Cache] Historical built: ${allTickets.length} all, ${completedTickets.length} completed`);
+  console.log(`[Cache] Historical tickets: ${allTickets.length} all, ${completedTickets.length} completed`);
   return { allTickets, completedTickets, builtAt: new Date() };
 }
 
-// ── Fetch recent data (last 30 days) ─────────────────────────────────────────
 async function fetchRecent() {
-  console.log('[Cache] Refreshing recent cache...');
+  console.log('[Cache] Refreshing recent ticket cache...');
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
@@ -303,50 +321,83 @@ async function fetchRecent() {
     { field: 'createDate', op: 'gte', value: thirtyDaysAgo.toISOString() }
   ]);
 
-  console.log(`[Cache] Recent built: ${allTickets.length} all, ${openTickets.length} open, ${completedTickets.length} completed`);
+  console.log(`[Cache] Recent tickets: ${allTickets.length} all, ${openTickets.length} open, ${completedTickets.length} completed`);
   return { allTickets, openTickets, completedTickets, builtAt: new Date() };
 }
 
-// ── Regular Sync endpoint ─────────────────────────────────────────────────────
+// ── Time entry fetchers ───────────────────────────────────────────────────────
+async function fetchHistoricalTimeEntries(ticketIDSet) {
+  console.log('[TimeEntries] Building historical cache...');
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const items = await queryAllEntries('/TimeEntries/query', [
+    { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
+    { field: 'dateWorked', op: 'lt', value: thirtyDaysAgo.toISOString() },
+    { field: 'ticketID', op: 'exist' }
+  ]);
+
+  const filtered = items.filter(t =>
+    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
+    ticketIDSet.has(t.ticketID)
+  );
+
+  console.log(`[TimeEntries] Historical: ${items.length} total, ${filtered.length} after filter`);
+  return { items: filtered, builtAt: new Date() };
+}
+
+async function fetchRecentTimeEntries(ticketIDSet) {
+  console.log('[TimeEntries] Refreshing recent cache...');
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  const items = await queryAllEntries('/TimeEntries/query', [
+    { field: 'dateWorked', op: 'gte', value: thirtyDaysAgo.toISOString() },
+    { field: 'ticketID', op: 'exist' }
+  ]);
+
+  const filtered = items.filter(t =>
+    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
+    ticketIDSet.has(t.ticketID)
+  );
+
+  console.log(`[TimeEntries] Recent: ${items.length} total, ${filtered.length} after filter`);
+  return { items: filtered, builtAt: new Date() };
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+// Regular sync — refreshes recent tickets and time entries only
 router.get('/all', async (req, res, next) => {
   try {
-    // Build historical cache if missing
     if (!historicalCache) {
       historicalCache = await fetchHistorical();
     }
 
-    // Always refresh recent on sync
     recentCache = await fetchRecent();
 
-    // Merge
     const allTickets = mergeTickets(historicalCache.allTickets, recentCache.allTickets);
-    const completedTickets = mergeTickets(historicalCache.completedTickets, recentCache.completedTickets);
-    const openTickets = recentCache.openTickets;
+    const ticketIDSet = new Set(allTickets.map(t => t.id));
+
+    if (!historicalTimeEntryCache) {
+      historicalTimeEntryCache = await fetchHistoricalTimeEntries(ticketIDSet);
+    }
+
+    recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
 
     const resources = await fetchResources();
-
-    res.json({
-      allTickets,
-      completedTickets,
-      openTickets,
-      resources,
-      excludeResources: EXCLUDE_RESOURCES,
-      issueTypeMap: ISSUE_TYPE_MAP,
-      cacheInfo: {
-        historicalBuiltAt: historicalCache.builtAt,
-        recentBuiltAt: recentCache.builtAt,
-        totalTickets: allTickets.length
-      }
-    });
+    res.json(buildPayload(resources));
   } catch (err) {
     next(err);
   }
 });
 
-// ── Full refresh endpoint ─────────────────────────────────────────────────────
-router.get('/fullrefresh', async (req, res, next) => {
+// Full refresh step 1 — rebuild ticket caches only
+router.get('/refreshtickets', async (req, res, next) => {
   try {
-    console.log('[Cache] Full refresh requested — clearing caches...');
+    console.log('[FullRefresh] Step 1: Rebuilding ticket caches...');
     historicalCache = null;
     recentCache = null;
 
@@ -354,22 +405,45 @@ router.get('/fullrefresh', async (req, res, next) => {
     recentCache = await fetchRecent();
 
     const allTickets = mergeTickets(historicalCache.allTickets, recentCache.allTickets);
-    const completedTickets = mergeTickets(historicalCache.completedTickets, recentCache.completedTickets);
-    const openTickets = recentCache.openTickets;
-    const resources = await fetchResources();
 
     res.json({
-      allTickets,
-      completedTickets,
-      openTickets,
-      resources,
-      excludeResources: EXCLUDE_RESOURCES,
-      issueTypeMap: ISSUE_TYPE_MAP,
-      cacheInfo: {
-        historicalBuiltAt: historicalCache.builtAt,
-        recentBuiltAt: recentCache.builtAt,
-        totalTickets: allTickets.length
-      }
+      ok: true,
+      totalTickets: allTickets.length,
+      historicalBuiltAt: historicalCache.builtAt,
+      recentBuiltAt: recentCache.builtAt
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full refresh step 2 — rebuild time entry caches only
+router.get('/refreshtimeentries', async (req, res, next) => {
+  try {
+    if (!historicalCache || !recentCache) {
+      return res.status(400).json({ error: 'Ticket cache must be built first. Run /refreshtickets first.' });
+    }
+
+    console.log('[FullRefresh] Step 2: Rebuilding time entry caches...');
+    historicalTimeEntryCache = null;
+    recentTimeEntryCache = null;
+
+    const allTickets = mergeTickets(historicalCache.allTickets, recentCache.allTickets);
+    const ticketIDSet = new Set(allTickets.map(t => t.id));
+
+    historicalTimeEntryCache = await fetchHistoricalTimeEntries(ticketIDSet);
+    recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
+
+    const timeEntryMap = {};
+    [...(historicalTimeEntryCache.items || []), ...(recentTimeEntryCache.items || [])].forEach(t => {
+      timeEntryMap[t.id] = t;
+    });
+
+    res.json({
+      ok: true,
+      totalTimeEntries: Object.keys(timeEntryMap).length,
+      historicalBuiltAt: historicalTimeEntryCache.builtAt,
+      recentBuiltAt: recentTimeEntryCache.builtAt
     });
   } catch (err) {
     next(err);
