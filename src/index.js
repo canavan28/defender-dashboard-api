@@ -36,42 +36,6 @@ app.get('/queues', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/timeentrycount', async (req, res) => {
-  try {
-    const { autotaskClient } = require('./utils/autotask');
-    const axios = require('axios');
-    const { getHeaders } = require('./utils/autotask');
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
-    const filter = [
-      { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
-      { field: 'ticketID', op: 'exist' }
-    ];
-
-    let totalCount = 0;
-    let pageCount = 0;
-    let nextPageUrl = null;
-
-    const firstResponse = await autotaskClient.post('/TimeEntries/query', {
-      filter, maxRecords: 500
-    });
-    totalCount += firstResponse.data.items?.length || 0;
-    nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
-    pageCount++;
-
-    while (nextPageUrl) {
-      const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
-      totalCount += response.data.items?.length || 0;
-      nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
-      pageCount++;
-    }
-
-    res.json({ totalCount, pageCount });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/statuses', async (req, res) => {
   try {
