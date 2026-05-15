@@ -36,11 +36,22 @@ app.get('/queues', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/timeentryfields', async (req, res) => {
+app.get('/timeentrycount', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.get('/TimeEntries/entityInformation/fields');
-    res.json({ fields: response.data.fields || [] });
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const response = await autotaskClient.post('/TimeEntries/query', {
+      filter: [
+        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
+        { field: 'timeEntryType', op: 'eq', value: 1 }
+      ],
+      maxRecords: 1
+    });
+    res.json({ 
+      pageDetails: response.data.pageDetails,
+      sampleRecord: response.data.items?.[0]
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
