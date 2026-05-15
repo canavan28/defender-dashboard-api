@@ -43,14 +43,19 @@ app.get('/timeentrycount', async (req, res) => {
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
     const response = await autotaskClient.post('/TimeEntries/query', {
       filter: [
-        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
-        { field: 'timeEntryType', op: 'eq', value: 1 }
+        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() }
       ],
-      maxRecords: 1
+      maxRecords: 3
     });
     res.json({ 
       pageDetails: response.data.pageDetails,
-      sampleRecord: response.data.items?.[0]
+      samples: response.data.items?.map(t => ({
+        timeEntryType: t.timeEntryType,
+        ticketID: t.ticketID,
+        hoursWorked: t.hoursWorked,
+        dateWorked: t.dateWorked,
+        resourceID: t.resourceID
+      }))
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
