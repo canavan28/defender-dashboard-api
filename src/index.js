@@ -66,4 +66,7 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Defender Dashboard API running on port ${PORT}`);
+  
+  const fs = require('fs');
+  console.log('[Volume] Data path accessible:', fs.existsSync('/app/data'));
 });
