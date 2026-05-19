@@ -41,12 +41,7 @@ function verifyApiKey(req, res, next) {
   if (err) {
     console.error('[Auth] Token verification failed:', err.message);
     // Decode without verification to see what's inside
-    const unverified = jwt.decode(token);
-    console.log('[Auth] Token contents:', JSON.stringify({
-      aud: unverified?.aud,
-      iss: unverified?.issuer || unverified?.iss,
-      oid: unverified?.oid,
-    }));
+    
     return res.status(401).json({ error: 'Invalid token' });
   }
   
