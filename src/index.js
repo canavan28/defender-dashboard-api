@@ -59,6 +59,8 @@ app.get('/techlist', async (req, res) => {
 
 app.use('/api', verifyApiKey);
 app.use('/api/tickets', ticketsRouter);
+const aiReviewRouter = require('./routes/aireview');
+app.use('/api/aireview', aiReviewRouter);
 
 app.use((err, req, res, next) => {
   console.error('[Error]', err.message);
