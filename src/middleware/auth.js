@@ -31,17 +31,25 @@ function verifyApiKey(req, res, next) {
   }
 
   jwt.verify(token, getKey, {
-    audience: `api://${CLIENT_ID}`,
-    issuer: [
-      `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
-      `https://sts.windows.net/${TENANT_ID}/`
-    ],
-    algorithms: ['RS256']
-  }, (err, decoded) => {
-    if (err) {
-      console.error('[Auth] Token verification failed:', err.message);
-      return res.status(401).json({ error: 'Invalid token' });
-    }
+  audience: `api://${CLIENT_ID}`,
+  issuer: [
+    `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+    `https://sts.windows.net/${TENANT_ID}/`
+  ],
+  algorithms: ['RS256']
+}, (err, decoded) => {
+  if (err) {
+    console.error('[Auth] Token verification failed:', err.message);
+    // Decode without verification to see what's inside
+    const unverified = jwt.decode(token);
+    console.log('[Auth] Token contents:', JSON.stringify({
+      aud: unverified?.aud,
+      iss: unverified?.issuer || unverified?.iss,
+      oid: unverified?.oid,
+    }));
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+  
 
     // Check object ID against allowlist
     const oid = decoded.oid || decoded.sub;
