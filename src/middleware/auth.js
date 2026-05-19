@@ -31,7 +31,7 @@ function verifyApiKey(req, res, next) {
   }
 
   jwt.verify(token, getKey, {
-    audience: CLIENT_ID,
+    audience: `api://${CLIENT_ID}`,
     issuer: [
       `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
       `https://sts.windows.net/${TENANT_ID}/`
