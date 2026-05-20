@@ -13,10 +13,10 @@ const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
 
 const TECH_TIERS = {
   29682924: { name: 'Carlos Agundez', tier: 1 },
-  29682927: { name: 'Ben Holliday',   tier: 1 },
-  29682910: { name: 'Brandon Emby',   tier: 2 },
-  29682889: { name: 'Matt Cartrett',  tier: 2 },
-  29682904: { name: 'Rob Coleman',    tier: 3 },
+  29682927: { name: 'Ben Holliday', tier: 1 },
+  29682910: { name: 'Brandon Emby', tier: 2 },
+  29682889: { name: 'Matt Cartrett', tier: 2 },
+  29682904: { name: 'Rob Coleman', tier: 3 },
   29682899: { name: 'Chris McDaniel', tier: 3 }
 };
 
@@ -170,10 +170,10 @@ ${JSON.stringify(ticketSummaries, null, 2)}
 
 COMPANY GROUPINGS:
 ${JSON.stringify(Object.entries(byCompany).map(([id, tickets]) => ({
-  companyId: id,
-  ticketCount: tickets.length,
-  issueTypes: [...new Set(tickets.map(t => t.issueType))]
-})), null, 2)}
+    companyId: id,
+    ticketCount: tickets.length,
+    issueTypes: [...new Set(tickets.map(t => t.issueType))]
+  })), null, 2)}
 
 Return ONLY a JSON array of flagged tickets. If none warrant flagging return [].
 Each item must have:
@@ -333,7 +333,23 @@ router.post('/run', async (req, res, next) => {
       console.log(`[AIReview] Batch ${i + 1}/${batches.length} — ${batch.length} tickets`);
 
       // Analyze with Claude
-      const aiFlags = await analyzeBatch(batch, companyMap);
+      let aiFlags = [];
+      let retries = 0;
+      while (retries < 3) {
+        try {
+          aiFlags = await analyzeBatch(batch, companyMap);
+          break;
+        } catch (err) {
+          if (err.response?.status === 429 && retries < 2) {
+            console.log(`[AIReview] Rate limited, waiting 30s before retry ${retries + 1}...`);
+            await new Promise(r => setTimeout(r, 30000));
+            retries++;
+          } else {
+            console.error(`[AIReview] Batch ${i + 1} failed:`, err.message);
+            break;
+          }
+        }
+      }
 
       // Mark batch as reviewed
       batch.forEach(t => {
@@ -378,7 +394,7 @@ router.post('/run', async (req, res, next) => {
 
       // Small delay between batches to avoid rate limits
       if (i < batches.length - 1) {
-        await new Promise(r => setTimeout(r, 1000));
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
 
