@@ -385,8 +385,10 @@ router.post('/run', async (req, res, next) => {
 
       // Save progress after each batch
       data.reviewed = reviewed;
-      const existingActioned = (data.flags || []).filter(f => f.action !== 'unactioned');
-      const allFlags = [...existingActioned, ...allNewFlags];
+      const existingFlagMap = {};
+      (data.flags || []).forEach(f => { existingFlagMap[f.id] = f; });
+      allNewFlags.forEach(f => { existingFlagMap[f.id] = f; });
+      const allFlags = Object.values(existingFlagMap);
       const sevRank = { critical: 0, high: 1, medium: 2, low: 3 };
       allFlags.sort((a, b) => (sevRank[a.sev] || 3) - (sevRank[b.sev] || 3));
       data.flags = allFlags;
