@@ -26,13 +26,13 @@ app.get('/health', (req, res) => {
 });
 
 // Temporary lookup routes
-app.get('/queues', async (req, res) => {
+app.get('/categories', async (req, res) => {
   try {
     const { autotaskClient } = require('./utils/autotask');
     const response = await autotaskClient.get('/Tickets/entityInformation/fields');
     const fields = response.data.fields || [];
-    const queueField = fields.find(f => f.name === 'queueID');
-    res.json({ queues: queueField?.picklistValues || [] });
+    const catField = fields.find(f => f.name === 'ticketCategory');
+    res.json({ categories: catField?.picklistValues || [] });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
