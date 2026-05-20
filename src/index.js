@@ -36,6 +36,15 @@ app.get('/categories', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Temporary flags report
+app.get('/flagsreport', (req, res) => {
+  // ... paste the full route code here
+});
+
 
 app.get('/statuses', async (req, res) => {
   try {
