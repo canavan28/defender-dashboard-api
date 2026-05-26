@@ -64,10 +64,12 @@ app.get('/flagsreport', (req, res) => {
         ticketUrl: `https://ww14.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx?Code=OpenTicketDetail&TicketNumber=${id}`
       }));
 
-    const allFlags = [...flagsArray, ...reviewedWithIssues].sort((a, b) => {
-      const rank = { critical: 0, high: 1, medium: 2, low: 3, unknown: 4 };
-      return (rank[a.sev] || 4) - (rank[b.sev] || 4);
-    });
+    const allFlags = [...flagsArray, ...reviewedWithIssues]
+      .filter(f => f.sev === 'critical' || f.sev === 'high')
+      .sort((a, b) => {
+        const rank = { critical: 0, high: 1, medium: 2, low: 3, unknown: 4 };
+        return (rank[a.sev] || 4) - (rank[b.sev] || 4);
+      });
 
     const page = parseInt(req.query.page || '1');
     const perPage = 50;
@@ -120,8 +122,8 @@ app.get('/flagsreport', (req, res) => {
         </table>
         <div class="pages">
           ${Array.from({ length: totalPages }, (_, i) => i + 1).map(p =>
-            `<a href="/flagsreport?page=${p}" class="${p === page ? 'active' : ''}">${p}</a>`
-          ).join('')}
+      `<a href="/flagsreport?page=${p}" class="${p === page ? 'active' : ''}">${p}</a>`
+    ).join('')}
         </div>
       </body></html>
     `;
