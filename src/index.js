@@ -45,16 +45,35 @@ app.get('/flagsreport', (req, res) => {
     const fs = require('fs');
     const raw = fs.readFileSync('/app/data/reviewed.json', 'utf8');
     const data = JSON.parse(raw);
-    const flags = (data.flags || []).sort((a, b) => {
-      const rank = { critical: 0, high: 1, medium: 2, low: 3 };
-      return (rank[a.sev] || 3) - (rank[b.sev] || 3);
+
+    // Get flags from the flags array
+    const flagsArray = data.flags || [];
+
+    // Also check reviewed object for any with hasIssues: true not in flags array
+    const flagIds = new Set(flagsArray.map(f => f.id));
+    const reviewedWithIssues = Object.entries(data.reviewed || {})
+      .filter(([id, r]) => r.hasIssues && !flagIds.has(id))
+      .map(([id, r]) => ({
+        id,
+        sev: r.flagType ? 'unknown' : 'unknown',
+        flagType: r.flagType || 'unknown',
+        summary: r.summary || 'No summary stored',
+        company: r.company || 'Unknown',
+        action: r.action || 'unactioned',
+        dateFlagged: r.reviewedAt,
+        ticketUrl: `https://ww14.autotask.net/Autotask/AutotaskExtend/ExecuteCommand.aspx?Code=OpenTicketDetail&TicketNumber=${id}`
+      }));
+
+    const allFlags = [...flagsArray, ...reviewedWithIssues].sort((a, b) => {
+      const rank = { critical: 0, high: 1, medium: 2, low: 3, unknown: 4 };
+      return (rank[a.sev] || 4) - (rank[b.sev] || 4);
     });
 
     const page = parseInt(req.query.page || '1');
     const perPage = 50;
-    const total = flags.length;
+    const total = allFlags.length;
     const totalPages = Math.ceil(total / perPage);
-    const paginated = flags.slice((page - 1) * perPage, page * perPage);
+    const paginated = allFlags.slice((page - 1) * perPage, page * perPage);
 
     const html = `
       <html><head><title>AI Review Flags</title>
@@ -68,18 +87,19 @@ app.get('/flagsreport', (req, res) => {
         .high { color: #9a3412; font-weight: 600; }
         .medium { color: #854d0e; }
         .low { color: #334155; }
+        .unknown { color: #64748b; }
         a { color: #2563eb; }
         h1 { font-size: 18px; margin-bottom: 4px; }
         .meta { color: #64748b; font-size: 12px; margin-bottom: 20px; }
-        .pages { margin-top: 20px; display: flex; gap: 8px; }
-        .pages a { padding: 4px 10px; border: 1px solid #e2e8f0; border-radius: 4px; text-decoration: none; }
+        .pages { margin-top: 20px; display: flex; gap: 8px; flex-wrap: wrap; }
+        .pages a { padding: 4px 10px; border: 1px solid #e2e8f0; border-radius: 4px; text-decoration: none; color: #2563eb; }
         .pages a.active { background: #2563eb; color: white; border-color: #2563eb; }
       </style></head>
       <body>
         <h1>AI Review — Flagged Tickets</h1>
         <div class="meta">
-          ${total} total flags · Page ${page} of ${totalPages} · 
-          Generated ${new Date().toLocaleString()}
+          ${total} total flags (${flagsArray.length} with full detail, ${reviewedWithIssues.length} summary only) · 
+          Page ${page} of ${totalPages} · Generated ${new Date().toLocaleString()}
         </div>
         <table>
           <tr>
@@ -100,8 +120,8 @@ app.get('/flagsreport', (req, res) => {
         </table>
         <div class="pages">
           ${Array.from({ length: totalPages }, (_, i) => i + 1).map(p =>
-      `<a href="/flagsreport?page=${p}" class="${p === page ? 'active' : ''}">${p}</a>`
-    ).join('')}
+            `<a href="/flagsreport?page=${p}" class="${p === page ? 'active' : ''}">${p}</a>`
+          ).join('')}
         </div>
       </body></html>
     `;
