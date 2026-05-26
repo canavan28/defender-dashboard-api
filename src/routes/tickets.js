@@ -1,9 +1,16 @@
 const express = require('express');
-const router = express.Router();
+const router = require('express').Router();
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 const { autotaskClient, getHeaders } = require('../utils/autotask');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// ── Cache file paths ──────────────────────────────────────────────────────────
+const CACHE_DIR = '/app/data';
+const HISTORICAL_CACHE_FILE = path.join(CACHE_DIR, 'tickets-historical.json');
+const RECENT_CACHE_FILE = path.join(CACHE_DIR, 'tickets-recent.json');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
@@ -150,11 +157,60 @@ const SUB_ISSUE_MAP = {
   '295': { label: 'Printer Offline', parent: '30' }
 };
 
-// ── Caches ───────────────────────────────────────────────────────────────────
+// ── In-memory caches ──────────────────────────────────────────────────────────
 let historicalCache = null;
 let recentCache = null;
 let historicalTimeEntryCache = null;
 let recentTimeEntryCache = null;
+
+// ── Disk cache helpers ────────────────────────────────────────────────────────
+function ensureCacheDir() {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+}
+
+function saveCacheToDisk(filePath, data) {
+  try {
+    ensureCacheDir();
+    fs.writeFileSync(filePath, JSON.stringify(data));
+    console.log(`[Cache] Saved to disk: ${path.basename(filePath)} (${Math.round(JSON.stringify(data).length / 1024)}KB)`);
+  } catch (err) {
+    console.error(`[Cache] Failed to save ${filePath}:`, err.message);
+  }
+}
+
+function loadCacheFromDisk(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      console.log(`[Cache] Loaded from disk: ${path.basename(filePath)} (${Math.round(JSON.stringify(data).length / 1024)}KB)`);
+      return data;
+    }
+  } catch (err) {
+    console.error(`[Cache] Failed to load ${filePath}:`, err.message);
+  }
+  return null;
+}
+
+// ── Load caches from disk on startup ─────────────────────────────────────────
+function initializeCaches() {
+  console.log('[Cache] Initializing from disk...');
+  const historical = loadCacheFromDisk(HISTORICAL_CACHE_FILE);
+  const recent = loadCacheFromDisk(RECENT_CACHE_FILE);
+
+  if (historical) {
+    historicalCache = historical;
+    console.log(`[Cache] Historical loaded: ${historical.allTickets?.length} tickets, built ${historical.builtAt}`);
+  }
+  if (recent) {
+    recentCache = recent;
+    console.log(`[Cache] Recent loaded: ${recent.allTickets?.length} tickets, built ${recent.builtAt}`);
+  }
+}
+
+// Initialize on module load
+initializeCaches();
 
 // ── Pagination helpers ────────────────────────────────────────────────────────
 async function queryAllTickets(filter) {
@@ -180,12 +236,12 @@ async function queryAllTickets(filter) {
   return allItems;
 }
 
-async function queryAllEntries(path, filter) {
+async function queryAllEntries(path2, filter) {
   let allItems = [];
   let nextPageUrl = null;
   let pageCount = 0;
 
-  const firstResponse = await autotaskClient.post(path, { filter, maxRecords: 500 });
+  const firstResponse = await autotaskClient.post(path2, { filter, maxRecords: 500 });
   allItems = [...(firstResponse.data.items || [])];
   nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
   pageCount++;
@@ -198,11 +254,11 @@ async function queryAllEntries(path, filter) {
     pageCount++;
   }
 
-  console.log(`[Pagination] ${path} complete: ${pageCount} pages, ${allItems.length} items`);
+  console.log(`[Pagination] ${path2} complete: ${pageCount} pages, ${allItems.length} items`);
   return allItems;
 }
 
-// ── Merge helper ──────────────────────────────────────────────────────────────
+// ── Merge helpers ─────────────────────────────────────────────────────────────
 function mergeTickets(historical, recent) {
   const map = {};
   (historical || []).forEach(t => { map[t.id] = t; });
@@ -210,16 +266,10 @@ function mergeTickets(historical, recent) {
   return Object.values(map);
 }
 
-// ── Build merged response payload ─────────────────────────────────────────────
+// ── Build response payload ────────────────────────────────────────────────────
 function buildPayload(resources) {
-  const allTickets = mergeTickets(
-    historicalCache?.allTickets,
-    recentCache?.allTickets
-  );
-  const completedTickets = mergeTickets(
-    historicalCache?.completedTickets,
-    recentCache?.completedTickets
-  );
+  const allTickets = mergeTickets(historicalCache?.allTickets, recentCache?.allTickets);
+  const completedTickets = mergeTickets(historicalCache?.completedTickets, recentCache?.completedTickets);
   const openTickets = recentCache?.openTickets || [];
 
   const timeEntryMap = {};
@@ -242,7 +292,8 @@ function buildPayload(resources) {
       recentBuiltAt: recentCache?.builtAt,
       timeEntriesBuiltAt: recentTimeEntryCache?.builtAt,
       totalTickets: allTickets.length,
-      totalTimeEntries: timeEntries.length
+      totalTimeEntries: timeEntries.length,
+      loadedFromDisk: historicalCache?.loadedFromDisk || false
     }
   };
 }
@@ -290,7 +341,9 @@ async function fetchHistorical() {
   ]);
 
   console.log(`[Cache] Historical tickets: ${allTickets.length} all, ${completedTickets.length} completed`);
-  return { allTickets, completedTickets, builtAt: new Date() };
+  const cache = { allTickets, completedTickets, builtAt: new Date().toISOString() };
+  saveCacheToDisk(HISTORICAL_CACHE_FILE, cache);
+  return cache;
 }
 
 async function fetchRecent() {
@@ -322,7 +375,9 @@ async function fetchRecent() {
   ]);
 
   console.log(`[Cache] Recent tickets: ${allTickets.length} all, ${openTickets.length} open, ${completedTickets.length} completed`);
-  return { allTickets, openTickets, completedTickets, builtAt: new Date() };
+  const cache = { allTickets, openTickets, completedTickets, builtAt: new Date().toISOString() };
+  saveCacheToDisk(RECENT_CACHE_FILE, cache);
+  return cache;
 }
 
 // ── Time entry fetchers ───────────────────────────────────────────────────────
@@ -340,12 +395,11 @@ async function fetchHistoricalTimeEntries(ticketIDSet) {
   ]);
 
   const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
-    ticketIDSet.has(t.ticketID)
+    !EXCLUDE_RESOURCES_SET.has(t.resourceID) && ticketIDSet.has(t.ticketID)
   );
 
   console.log(`[TimeEntries] Historical: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date() };
+  return { items: filtered, builtAt: new Date().toISOString() };
 }
 
 async function fetchRecentTimeEntries(ticketIDSet) {
@@ -359,23 +413,23 @@ async function fetchRecentTimeEntries(ticketIDSet) {
   ]);
 
   const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) &&
-    ticketIDSet.has(t.ticketID)
+    !EXCLUDE_RESOURCES_SET.has(t.resourceID) && ticketIDSet.has(t.ticketID)
   );
 
   console.log(`[TimeEntries] Recent: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date() };
+  return { items: filtered, builtAt: new Date().toISOString() };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-// Regular sync — refreshes recent tickets and time entries only
 router.get('/all', async (req, res, next) => {
   try {
+    // Use disk cache if available, otherwise build
     if (!historicalCache) {
       historicalCache = await fetchHistorical();
     }
 
+    // Always refresh recent on sync
     recentCache = await fetchRecent();
 
     const allTickets = mergeTickets(historicalCache.allTickets, recentCache.allTickets);
@@ -394,7 +448,6 @@ router.get('/all', async (req, res, next) => {
   }
 });
 
-// Full refresh step 1 — rebuild ticket caches only
 router.get('/refreshtickets', async (req, res, next) => {
   try {
     console.log('[FullRefresh] Step 1: Rebuilding ticket caches...');
@@ -417,11 +470,10 @@ router.get('/refreshtickets', async (req, res, next) => {
   }
 });
 
-// Full refresh step 2 — rebuild time entry caches only
 router.get('/refreshtimeentries', async (req, res, next) => {
   try {
     if (!historicalCache || !recentCache) {
-      return res.status(400).json({ error: 'Ticket cache must be built first. Run /refreshtickets first.' });
+      return res.status(400).json({ error: 'Ticket cache must be built first.' });
     }
 
     console.log('[FullRefresh] Step 2: Rebuilding time entry caches...');
