@@ -292,7 +292,7 @@ async function fetchCompanyNames(companyIds) {
 }
 
 // ── Build response payload ────────────────────────────────────────────────────
-async function buildPayload(resources) {
+function buildPayload(resources, companyMap) {
   const allTickets = mergeTickets(historicalCache?.allTickets, recentCache?.allTickets);
   const completedTickets = mergeTickets(historicalCache?.completedTickets, recentCache?.completedTickets);
   const openTickets = recentCache?.openTickets || [];
@@ -303,9 +303,6 @@ async function buildPayload(resources) {
   });
   const timeEntries = Object.values(timeEntryMap);
 
-  // Resolve company names for all tickets
-  const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
-  const companyMap = await fetchCompanyNames(companyIds);
 
   return {
     allTickets,
@@ -327,13 +324,7 @@ async function buildPayload(resources) {
     }
   };
 }
-const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
-const companyMap = await fetchCompanyNames(companyIds);
 
-// TEMP DEBUG — remove after confirming
-console.log('[Debug] Sample companyIds from tickets:', companyIds.slice(0, 3), typeof companyIds[0]);
-console.log('[Debug] Sample companyMap keys:', Object.keys(companyMap).slice(0, 3), typeof Object.keys(companyMap)[0]);
-console.log('[Debug] Sample lookup test:', companyIds[0], companyMap[companyIds[0]]);
 // ── Resources ─────────────────────────────────────────────────────────────────
 async function fetchResources() {
   const response = await autotaskClient.post('/Resources/query', {
@@ -478,7 +469,9 @@ router.get('/all', async (req, res, next) => {
     recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
 
     const resources = await fetchResources();
-    res.json(await buildPayload(resources));
+    const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
+    const companyMap = await fetchCompanyNames(companyIds);
+    res.json(buildPayload(resources, companyMap));
   } catch (err) {
     next(err);
   }
