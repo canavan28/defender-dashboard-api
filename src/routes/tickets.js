@@ -280,7 +280,7 @@ async function fetchCompanyNames(companyIds) {
         filter: [{ field: 'id', op: 'in', value: chunk }]
       });
       (response.data.items || []).forEach(c => {
-        companyMap[c.id] = c.companyName;
+        companyMap[String(c.id)] = c.companyName;
       });
       if (i + CHUNK < companyIds.length) await sleep(300);
     }
