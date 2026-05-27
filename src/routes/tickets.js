@@ -266,8 +266,33 @@ function mergeTickets(historical, recent) {
   return Object.values(map);
 }
 
+// ── Fetch company names (same pattern as aireview.js) ────────────────────────
+async function fetchCompanyNames(companyIds) {
+  if (!companyIds.length) return {};
+  const companyMap = {};
+  try {
+    // AutoTask /Companies/query supports up to 500 IDs per request
+    // Chunk in case there are more than 500 unique companies
+    const CHUNK = 500;
+    for (let i = 0; i < companyIds.length; i += CHUNK) {
+      const chunk = companyIds.slice(i, i + CHUNK);
+      const response = await autotaskClient.post('/Companies/query', {
+        filter: [{ field: 'id', op: 'in', value: chunk }]
+      });
+      (response.data.items || []).forEach(c => {
+        companyMap[c.id] = c.companyName;
+      });
+      if (i + CHUNK < companyIds.length) await sleep(300);
+    }
+    console.log(`[Companies] Resolved ${Object.keys(companyMap).length} company names`);
+  } catch (err) {
+    console.warn('[Companies] Could not fetch company names:', err.message);
+  }
+  return companyMap;
+}
+
 // ── Build response payload ────────────────────────────────────────────────────
-function buildPayload(resources) {
+async function buildPayload(resources) {
   const allTickets = mergeTickets(historicalCache?.allTickets, recentCache?.allTickets);
   const completedTickets = mergeTickets(historicalCache?.completedTickets, recentCache?.completedTickets);
   const openTickets = recentCache?.openTickets || [];
@@ -278,6 +303,10 @@ function buildPayload(resources) {
   });
   const timeEntries = Object.values(timeEntryMap);
 
+  // Resolve company names for all tickets
+  const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
+  const companyMap = await fetchCompanyNames(companyIds);
+
   return {
     allTickets,
     completedTickets,
@@ -287,6 +316,7 @@ function buildPayload(resources) {
     excludeResources: EXCLUDE_RESOURCES,
     issueTypeMap: ISSUE_TYPE_MAP,
     subIssueMap: SUB_ISSUE_MAP,
+    companyMap,
     cacheInfo: {
       historicalBuiltAt: historicalCache?.builtAt,
       recentBuiltAt: recentCache?.builtAt,
@@ -442,7 +472,7 @@ router.get('/all', async (req, res, next) => {
     recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
 
     const resources = await fetchResources();
-    res.json(buildPayload(resources));
+    res.json(await buildPayload(resources));
   } catch (err) {
     next(err);
   }
