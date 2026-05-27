@@ -327,7 +327,13 @@ async function buildPayload(resources) {
     }
   };
 }
+const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
+const companyMap = await fetchCompanyNames(companyIds);
 
+// TEMP DEBUG — remove after confirming
+console.log('[Debug] Sample companyIds from tickets:', companyIds.slice(0, 3), typeof companyIds[0]);
+console.log('[Debug] Sample companyMap keys:', Object.keys(companyMap).slice(0, 3), typeof Object.keys(companyMap)[0]);
+console.log('[Debug] Sample lookup test:', companyIds[0], companyMap[companyIds[0]]);
 // ── Resources ─────────────────────────────────────────────────────────────────
 async function fetchResources() {
   const response = await autotaskClient.post('/Resources/query', {
