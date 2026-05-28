@@ -247,12 +247,14 @@ async function analyzeTrends(reviewedMetadata, companyMap) {
         issueTypes: {},
         avgResolutionDays: [],
         escalationCount: 0,
-        monthlyActivity: {}
+        monthlyActivity: {},
+        ticketNumbers: []   // for drill-down
       };
     }
 
     const co = byCompany[companyId];
     co.ticketCount++;
+    co.ticketNumbers.push(ticketNum);
     if (meta.hasIssues) co.flaggedCount++;
     if (meta.wasEscalated) co.escalationCount++;
     if (meta.resolutionDays != null) co.avgResolutionDays.push(meta.resolutionDays);
@@ -277,11 +279,13 @@ async function analyzeTrends(reviewedMetadata, companyMap) {
           escalationCount: 0,
           flagTypes: {},
           issueTypes: {},
-          avgResolutionDays: []
+          avgResolutionDays: [],
+          ticketNumbers: []   // for drill-down
         };
       }
       const te = byTech[techId];
       te.ticketCount++;
+      te.ticketNumbers.push(ticketNum);
       if (meta.hasIssues) te.flaggedCount++;
       if (meta.wasEscalated) te.escalationCount++;
       if (meta.resolutionDays != null) te.avgResolutionDays.push(meta.resolutionDays);
@@ -378,7 +382,39 @@ Only include items with genuine patterns worth executive attention. Return empty
   try {
     const content = response.data.content[0]?.text || '{}';
     const clean = content.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
+    const result = JSON.parse(clean);
+
+    // Build lookup maps: companyName -> ticketNumbers, techName -> ticketNumbers
+    const companyTicketMap = {};
+    Object.values(byCompany).forEach(co => {
+      companyTicketMap[co.companyName] = co.ticketNumbers || [];
+    });
+    const techTicketMap = {};
+    Object.values(byTech).forEach(te => {
+      techTicketMap[te.techName] = te.ticketNumbers || [];
+    });
+
+    // Attach ticket numbers to each trend item
+    if (result.companyTrends) {
+      result.companyTrends = result.companyTrends.map(item => ({
+        ...item,
+        ticketNumbers: companyTicketMap[item.companyName] || []
+      }));
+    }
+    if (result.techPatterns) {
+      result.techPatterns = result.techPatterns.map(item => ({
+        ...item,
+        ticketNumbers: techTicketMap[item.techName] || []
+      }));
+    }
+    if (result.sentimentSignals) {
+      result.sentimentSignals = result.sentimentSignals.map(item => ({
+        ...item,
+        ticketNumbers: companyTicketMap[item.companyName] || []
+      }));
+    }
+
+    return result;
   } catch (err) {
     console.error('[AIReview] Failed to parse trend response:', err.message);
     return { companyTrends: [], techPatterns: [], sentimentSignals: [] };
