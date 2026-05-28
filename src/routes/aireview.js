@@ -10,6 +10,7 @@ const AUTOTASK_ZONE = (process.env.AUTOTASK_ZONE_URL || '').replace('/ATServices
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
+const EXCLUDE_CATEGORIES = new Set([104]); // 104 = LUV Credit Card Requests
 
 const TECH_TIERS = {
   29682924: { name: 'Carlos Agundez', tier: 1 },
@@ -18,6 +19,15 @@ const TECH_TIERS = {
   29682889: { name: 'Matt Cartrett', tier: 2 },
   29682904: { name: 'Rob Coleman', tier: 3 },
   29682899: { name: 'Chris McDaniel', tier: 3 }
+};
+
+// ── In-memory run state (for fire-and-forget polling) ─────────────────────────
+let runState = {
+  running: false,
+  progress: 0,      // 0-100
+  phase: '',        // current phase label
+  startedAt: null,
+  error: null
 };
 
 // ── PII scrubbing ─────────────────────────────────────────────────────────────
@@ -43,7 +53,7 @@ function loadData() {
   } catch (err) {
     console.error('[AIReview] Error loading data file:', err.message);
   }
-  return { reviewed: {}, lastReviewRun: null, reviewStats: {}, exclusions: [], flags: [] };
+  return { reviewed: {}, lastReviewRun: null, reviewStats: {}, exclusions: [], flags: [], trends: null };
 }
 
 function saveData(data) {
@@ -77,9 +87,7 @@ async function fetchAllTicketsForReview() {
   let allTickets = [];
   let nextPageUrl = null;
 
-  const firstResponse = await autotaskClient.post('/Tickets/query', {
-    filter, maxRecords: 500
-  });
+  const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
   allTickets = [...(firstResponse.data.items || [])];
   nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
 
@@ -90,7 +98,10 @@ async function fetchAllTicketsForReview() {
     nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
   }
 
-  console.log(`[AIReview] Fetched ${allTickets.length} tickets from approved queues`);
+  // Filter out excluded categories (e.g. LUV Credit Card Requests = 104)
+  const before = allTickets.length;
+  allTickets = allTickets.filter(t => !EXCLUDE_CATEGORIES.has(t.ticketCategory));
+  console.log(`[AIReview] Fetched ${before} tickets, ${allTickets.length} after category filter`);
   return allTickets;
 }
 
@@ -99,12 +110,17 @@ async function fetchCompanyNames(companyIds) {
   if (!companyIds.length) return {};
   const companyMap = {};
   try {
-    const response = await autotaskClient.post('/Companies/query', {
-      filter: [{ field: 'id', op: 'in', value: companyIds }]
-    });
-    (response.data.items || []).forEach(c => {
-      companyMap[c.id] = c.companyName;
-    });
+    const CHUNK = 500;
+    for (let i = 0; i < companyIds.length; i += CHUNK) {
+      const chunk = companyIds.slice(i, i + CHUNK);
+      const response = await autotaskClient.post('/Companies/query', {
+        filter: [{ field: 'id', op: 'in', value: chunk }]
+      });
+      (response.data.items || []).forEach(c => {
+        companyMap[String(c.id)] = c.companyName;
+      });
+      if (i + CHUNK < companyIds.length) await new Promise(r => setTimeout(r, 300));
+    }
   } catch (err) {
     console.warn('[AIReview] Could not fetch company names:', err.message);
   }
@@ -208,6 +224,352 @@ Each item must have:
   }
 }
 
+// ── Analyze trends across accumulated reviewed ticket metadata ─────────────────
+async function analyzeTrends(reviewedMetadata, companyMap) {
+  console.log(`[AIReview] Running trend analysis on ${Object.keys(reviewedMetadata).length} reviewed tickets...`);
+
+  // Build company-level summaries from metadata
+  const byCompany = {};
+  const byTech = {};
+
+  Object.entries(reviewedMetadata).forEach(([ticketNum, meta]) => {
+    if (!meta || !meta.companyID) return;
+
+    const companyId = String(meta.companyID);
+    const companyName = companyMap[companyId] || `Company ${companyId}`;
+
+    if (!byCompany[companyId]) {
+      byCompany[companyId] = {
+        companyName,
+        ticketCount: 0,
+        flaggedCount: 0,
+        flagTypes: {},
+        issueTypes: {},
+        avgResolutionDays: [],
+        escalationCount: 0,
+        monthlyActivity: {}
+      };
+    }
+
+    const co = byCompany[companyId];
+    co.ticketCount++;
+    if (meta.hasIssues) co.flaggedCount++;
+    if (meta.wasEscalated) co.escalationCount++;
+    if (meta.resolutionDays != null) co.avgResolutionDays.push(meta.resolutionDays);
+    if (meta.flagType) co.flagTypes[meta.flagType] = (co.flagTypes[meta.flagType] || 0) + 1;
+    if (meta.issueType) co.issueTypes[String(meta.issueType)] = (co.issueTypes[String(meta.issueType)] || 0) + 1;
+
+    // Track by month
+    const month = (meta.reviewedAt || '').substring(0, 7);
+    if (month) co.monthlyActivity[month] = (co.monthlyActivity[month] || 0) + 1;
+
+    // By tech
+    if (meta.techId) {
+      const techId = String(meta.techId);
+      const techInfo = TECH_TIERS[meta.techId];
+      const techName = techInfo?.name || `Tech ${techId}`;
+      if (!byTech[techId]) {
+        byTech[techId] = {
+          techName,
+          tier: techInfo?.tier || null,
+          ticketCount: 0,
+          flaggedCount: 0,
+          escalationCount: 0,
+          flagTypes: {},
+          issueTypes: {},
+          avgResolutionDays: []
+        };
+      }
+      const te = byTech[techId];
+      te.ticketCount++;
+      if (meta.hasIssues) te.flaggedCount++;
+      if (meta.wasEscalated) te.escalationCount++;
+      if (meta.resolutionDays != null) te.avgResolutionDays.push(meta.resolutionDays);
+      if (meta.flagType) te.flagTypes[meta.flagType] = (te.flagTypes[meta.flagType] || 0) + 1;
+      if (meta.issueType) te.issueTypes[String(meta.issueType)] = (te.issueTypes[String(meta.issueType)] || 0) + 1;
+    }
+  });
+
+  // Compute averages
+  Object.values(byCompany).forEach(co => {
+    co.avgResolutionDays = co.avgResolutionDays.length
+      ? Math.round(co.avgResolutionDays.reduce((a, b) => a + b, 0) / co.avgResolutionDays.length)
+      : null;
+    co.flagRate = co.ticketCount > 0 ? Math.round((co.flaggedCount / co.ticketCount) * 100) : 0;
+  });
+
+  Object.values(byTech).forEach(te => {
+    te.avgResolutionDays = te.avgResolutionDays.length
+      ? Math.round(te.avgResolutionDays.reduce((a, b) => a + b, 0) / te.avgResolutionDays.length)
+      : null;
+    te.escalationRate = te.ticketCount > 0 ? Math.round((te.escalationCount / te.ticketCount) * 100) : 0;
+    te.flagRate = te.ticketCount > 0 ? Math.round((te.flaggedCount / te.ticketCount) * 100) : 0;
+  });
+
+  // Only send companies with meaningful volume to Claude
+  const significantCompanies = Object.values(byCompany)
+    .filter(co => co.ticketCount >= 3)
+    .sort((a, b) => b.flagRate - a.flagRate)
+    .slice(0, 40);
+
+  const significantTechs = Object.values(byTech)
+    .filter(te => te.ticketCount >= 5)
+    .sort((a, b) => b.flagRate - a.flagRate);
+
+  const prompt = `You are analyzing long-term patterns in IT support data for an MSP executive team.
+
+You have accumulated data from ticket reviews over the past 6 months. Identify meaningful patterns that warrant executive attention.
+
+LOOK FOR:
+1. COMPANY TRENDS: Companies with persistent issues over time, high flag rates, recurring issue types, or growing ticket volumes. Flag companies where the same problems keep appearing month after month.
+2. TECH PATTERNS: Technicians with high escalation rates on specific issue types, unusually long resolution times, or consistent flag patterns. Note both concerning patterns and strong performers.
+3. SENTIMENT SIGNALS: Companies showing signs of deteriorating relationship — high flag rates, long resolution times, escalations, repeat issues across multiple months.
+
+COMPANY DATA (${significantCompanies.length} companies with 3+ tickets):
+${JSON.stringify(significantCompanies, null, 2)}
+
+TECH DATA (${significantTechs.length} techs with 5+ tickets):
+${JSON.stringify(significantTechs, null, 2)}
+
+Return ONLY a JSON object with this exact structure:
+{
+  "companyTrends": [
+    {
+      "companyName": "Acme Corp",
+      "severity": "critical|high|medium|low",
+      "headline": "One sentence describing the pattern",
+      "details": ["Detail point 1", "Detail point 2"],
+      "recommendation": "What exec should do"
+    }
+  ],
+  "techPatterns": [
+    {
+      "techName": "Carlos Agundez",
+      "type": "concern|strength",
+      "headline": "One sentence describing the pattern",
+      "details": ["Detail point 1", "Detail point 2"],
+      "recommendation": "What exec should do"
+    }
+  ],
+  "sentimentSignals": [
+    {
+      "companyName": "Acme Corp",
+      "severity": "critical|high|medium|low",
+      "signal": "One sentence describing the sentiment concern",
+      "supportingData": ["Data point 1", "Data point 2"]
+    }
+  ]
+}
+
+Only include items with genuine patterns worth executive attention. Return empty arrays if nothing significant found.`;
+
+  const response = await axios.post('https://api.anthropic.com/v1/messages', {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 3000,
+    messages: [{ role: 'user', content: prompt }]
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': process.env.ANTHROPIC_API_KEY
+    }
+  });
+
+  try {
+    const content = response.data.content[0]?.text || '{}';
+    const clean = content.replace(/```json|```/g, '').trim();
+    return JSON.parse(clean);
+  } catch (err) {
+    console.error('[AIReview] Failed to parse trend response:', err.message);
+    return { companyTrends: [], techPatterns: [], sentimentSignals: [] };
+  }
+}
+
+// ── Background review job ─────────────────────────────────────────────────────
+async function runReviewJob() {
+  const startTime = Date.now();
+  runState = { running: true, progress: 2, phase: 'Fetching tickets', startedAt: new Date().toISOString(), error: null };
+
+  try {
+    const data = loadData();
+    const excludedCompanyIds = new Set((data.exclusions || []).map(e => e.companyId));
+    const reviewed = data.reviewed || {};
+
+    console.log('[AIReview] Fetching all tickets from approved queues...');
+    const allTickets = await fetchAllTicketsForReview();
+
+    const toReview = allTickets.filter(t =>
+      !reviewed[t.ticketNumber] &&
+      !excludedCompanyIds.has(t.companyID)
+    );
+
+    console.log(`[AIReview] ${toReview.length} unreviewed tickets to process`);
+    runState.progress = 8;
+
+    if (toReview.length === 0) {
+      const now = new Date().toISOString();
+      data.lastReviewRun = now;
+      data.reviewStats = {
+        ...data.reviewStats,
+        lastRunAt: now,
+        lastRunReviewed: 0,
+        lastRunFlagged: 0,
+        totalReviewed: Object.keys(reviewed).length,
+        totalFlagged: (data.flags || []).length
+      };
+      saveData(data);
+      runState = { running: false, progress: 100, phase: 'Complete', startedAt: runState.startedAt, error: null };
+      return;
+    }
+
+    // Fetch company names
+    runState = { ...runState, phase: 'Fetching company names', progress: 10 };
+    const companyIds = [...new Set(toReview.map(t => t.companyID).filter(Boolean))];
+    const companyMap = await fetchCompanyNames(companyIds);
+
+    // Process in batches of 50
+    const BATCH_SIZE = 50;
+    const batches = [];
+    for (let i = 0; i < toReview.length; i += BATCH_SIZE) {
+      batches.push(toReview.slice(i, i + BATCH_SIZE));
+    }
+
+    console.log(`[AIReview] Processing ${batches.length} batches of up to ${BATCH_SIZE} tickets...`);
+
+    const allNewFlags = [];
+    const now = new Date().toISOString();
+
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const batchProgress = 10 + Math.round(((i + 1) / batches.length) * 70);
+      runState = { ...runState, phase: `Analyzing batch ${i + 1} of ${batches.length}`, progress: batchProgress };
+      console.log(`[AIReview] Batch ${i + 1}/${batches.length} — ${batch.length} tickets`);
+
+      let aiFlags = [];
+      let retries = 0;
+      while (retries < 3) {
+        try {
+          aiFlags = await analyzeBatch(batch, companyMap);
+          break;
+        } catch (err) {
+          if (err.response?.status === 429 && retries < 2) {
+            console.log(`[AIReview] Rate limited, waiting 30s before retry ${retries + 1}...`);
+            await new Promise(r => setTimeout(r, 30000));
+            retries++;
+          } else {
+            console.error(`[AIReview] Batch ${i + 1} failed:`, err.message);
+            break;
+          }
+        }
+      }
+
+      // Mark batch as reviewed with richer metadata
+      batch.forEach(t => {
+        const techIds = [t.assignedResourceID, t.completedByResourceID].filter(Boolean);
+        const wasEscalated = techIds.length > 1 &&
+          techIds.some(id => TECH_TIERS[id]?.tier === 1) &&
+          techIds.some(id => TECH_TIERS[id]?.tier >= 2);
+        const resolutionDays = t.createDate && t.completedDate
+          ? Math.round((new Date(t.completedDate) - new Date(t.createDate)) / (1000 * 60 * 60 * 24))
+          : null;
+        const aiFlag = aiFlags.find(f => f.ticketNumber === t.ticketNumber);
+
+        reviewed[t.ticketNumber] = {
+          reviewedAt: now,
+          hasIssues: !!aiFlag,
+          // Richer metadata for trend analysis
+          companyID: t.companyID,
+          issueType: t.issueType || null,
+          techId: t.assignedResourceID || null,
+          wasEscalated,
+          resolutionDays,
+          flagType: aiFlag?.flagType || null
+        };
+      });
+
+      // Build flag objects
+      aiFlags.forEach(f => {
+        const ticket = batch.find(t => t.ticketNumber === f.ticketNumber);
+        const companyName = ticket ? (companyMap[String(ticket.companyID)] || 'Unknown Company') : 'Unknown Company';
+        allNewFlags.push({
+          id: f.ticketNumber,
+          sev: f.severity,
+          flagType: f.flagType,
+          title: ticket?.title || f.ticketNumber,
+          summary: f.summary,
+          reasons: f.reasons || [],
+          notesForExec: f.notesForExec || '',
+          company: companyName,
+          companyId: ticket?.companyID,
+          issueType: ticket?.issueType,
+          tech: ticket ? [ticket.assignedResourceID, ticket.completedByResourceID]
+            .filter(Boolean)
+            .map(id => TECH_TIERS[id]?.name || `Tech ${id}`)
+            .join(', ') : '',
+          openedDays: ticket ? (
+            ticket.createDate && ticket.completedDate
+              ? Math.round((new Date(ticket.completedDate) - new Date(ticket.createDate)) / (1000 * 60 * 60 * 24))
+              : ticket.createDate
+                ? Math.round((new Date() - new Date(ticket.createDate)) / (1000 * 60 * 60 * 24))
+                : null
+          ) : null,
+          ticketUrl: ticketUrl(f.ticketNumber),
+          dateFlagged: now,
+          action: 'unactioned',
+          timeline: []
+        });
+      });
+
+      // Save progress after each batch
+      data.reviewed = reviewed;
+      const existingFlagMap = {};
+      (data.flags || []).forEach(f => { existingFlagMap[f.id] = f; });
+      allNewFlags.forEach(f => { existingFlagMap[f.id] = f; });
+      const allFlags = Object.values(existingFlagMap);
+      const sevRank = { critical: 0, high: 1, medium: 2, low: 3 };
+      allFlags.sort((a, b) => (sevRank[a.sev] || 3) - (sevRank[b.sev] || 3));
+      data.flags = allFlags;
+      saveData(data);
+
+      if (i < batches.length - 1) {
+        await new Promise(r => setTimeout(r, 3000));
+      }
+    }
+
+    // Run trend analysis on all accumulated metadata
+    runState = { ...runState, phase: 'Analyzing long-term trends', progress: 85 };
+    const allCompanyIds = [...new Set(Object.values(reviewed).map(m => m?.companyID).filter(Boolean))];
+    const allCompanyMap = await fetchCompanyNames(allCompanyIds);
+    const trends = await analyzeTrends(reviewed, allCompanyMap);
+
+    const duration = Math.round((Date.now() - startTime) / 1000);
+    const finalData = loadData();
+
+    finalData.lastReviewRun = now;
+    finalData.reviewStats = {
+      lastRunAt: now,
+      lastRunReviewed: toReview.length,
+      lastRunFlagged: allNewFlags.length,
+      totalReviewed: Object.keys(finalData.reviewed).length,
+      totalFlagged: (finalData.flags || []).length,
+      lastRunDuration: `${Math.floor(duration / 60)}m ${duration % 60}s`
+    };
+    finalData.trends = {
+      ...trends,
+      generatedAt: now,
+      ticketsAnalyzed: Object.keys(finalData.reviewed).length
+    };
+    saveData(finalData);
+
+    console.log(`[AIReview] Complete — ${toReview.length} reviewed, ${allNewFlags.length} flagged in ${duration}s`);
+    runState = { running: false, progress: 100, phase: 'Complete', startedAt: runState.startedAt, error: null };
+
+  } catch (err) {
+    console.error('[AIReview] Run failed:', err.message);
+    runState = { running: false, progress: 0, phase: 'Failed', startedAt: runState.startedAt, error: err.message };
+  }
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 router.get('/status', (req, res) => {
@@ -216,7 +578,13 @@ router.get('/status', (req, res) => {
     lastReviewRun: data.lastReviewRun,
     reviewStats: data.reviewStats || {},
     flags: data.flags || [],
-    exclusions: data.exclusions || []
+    exclusions: data.exclusions || [],
+    trends: data.trends || null,
+    // Live run state for polling
+    running: runState.running,
+    runProgress: runState.progress,
+    runPhase: runState.phase,
+    runError: runState.error
   });
 });
 
@@ -274,158 +642,14 @@ router.post('/action', (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/run', async (req, res, next) => {
-  const startTime = Date.now();
-  try {
-    const data = loadData();
-    const excludedCompanyIds = new Set((data.exclusions || []).map(e => e.companyId));
-    const reviewed = data.reviewed || {};
-
-    // Fetch all tickets from approved queues
-    console.log('[AIReview] Fetching all tickets from approved queues...');
-    const allTickets = await fetchAllTicketsForReview();
-
-    // Filter to unreviewed tickets not in excluded companies
-    const toReview = allTickets.filter(t =>
-      !reviewed[t.ticketNumber] &&
-      !excludedCompanyIds.has(t.companyID)
-    );
-
-    console.log(`[AIReview] ${toReview.length} unreviewed tickets to process`);
-
-    if (toReview.length === 0) {
-      const now = new Date().toISOString();
-      data.lastReviewRun = now;
-      data.reviewStats = {
-        ...data.reviewStats,
-        lastRunAt: now,
-        lastRunReviewed: 0,
-        lastRunFlagged: 0,
-        totalReviewed: Object.keys(reviewed).length,
-        totalFlagged: (data.flags || []).length
-      };
-      saveData(data);
-      return res.json({
-        ok: true, reviewed: 0, flagged: 0,
-        flags: data.flags || [],
-        message: 'All tickets already reviewed'
-      });
-    }
-
-    // Fetch company names for all tickets
-    const companyIds = [...new Set(toReview.map(t => t.companyID).filter(Boolean))];
-    const companyMap = await fetchCompanyNames(companyIds);
-
-    // Process in batches of 50
-    const BATCH_SIZE = 50;
-    const batches = [];
-    for (let i = 0; i < toReview.length; i += BATCH_SIZE) {
-      batches.push(toReview.slice(i, i + BATCH_SIZE));
-    }
-
-    console.log(`[AIReview] Processing ${batches.length} batches of up to ${BATCH_SIZE} tickets...`);
-
-    const allNewFlags = [];
-    const now = new Date().toISOString();
-
-    for (let i = 0; i < batches.length; i++) {
-      const batch = batches[i];
-      console.log(`[AIReview] Batch ${i + 1}/${batches.length} — ${batch.length} tickets`);
-
-      // Analyze with Claude
-      let aiFlags = [];
-      let retries = 0;
-      while (retries < 3) {
-        try {
-          aiFlags = await analyzeBatch(batch, companyMap);
-          break;
-        } catch (err) {
-          if (err.response?.status === 429 && retries < 2) {
-            console.log(`[AIReview] Rate limited, waiting 30s before retry ${retries + 1}...`);
-            await new Promise(r => setTimeout(r, 30000));
-            retries++;
-          } else {
-            console.error(`[AIReview] Batch ${i + 1} failed:`, err.message);
-            break;
-          }
-        }
-      }
-
-      // Mark batch as reviewed
-      batch.forEach(t => {
-        reviewed[t.ticketNumber] = {
-          reviewedAt: now,
-          hasIssues: aiFlags.some(f => f.ticketNumber === t.ticketNumber)
-        };
-      });
-
-      // Build flag objects
-      aiFlags.forEach(f => {
-        const ticket = batch.find(t => t.ticketNumber === f.ticketNumber);
-        const companyName = ticket ? (companyMap[ticket.companyID] || 'Unknown Company') : 'Unknown Company';
-        allNewFlags.push({
-          id: f.ticketNumber,
-          sev: f.severity,
-          flagType: f.flagType,
-          title: ticket?.title || f.ticketNumber,
-          summary: f.summary,
-          reasons: f.reasons || [],
-          notesForExec: f.notesForExec || '',
-          company: companyName,
-          companyId: ticket?.companyID,
-          issueType: ticket?.issueType,
-          tech: ticket?.techInvolved || '',
-          openedDays: ticket?.openDays,
-          ticketUrl: ticketUrl(f.ticketNumber),
-          dateFlagged: now,
-          action: 'unactioned',
-          timeline: []
-        });
-      });
-
-      // Save progress after each batch
-      data.reviewed = reviewed;
-      const existingFlagMap = {};
-      (data.flags || []).forEach(f => { existingFlagMap[f.id] = f; });
-      allNewFlags.forEach(f => { existingFlagMap[f.id] = f; });
-      const allFlags = Object.values(existingFlagMap);
-      const sevRank = { critical: 0, high: 1, medium: 2, low: 3 };
-      allFlags.sort((a, b) => (sevRank[a.sev] || 3) - (sevRank[b.sev] || 3));
-      data.flags = allFlags;
-      saveData(data);
-
-      // Small delay between batches to avoid rate limits
-      if (i < batches.length - 1) {
-        await new Promise(r => setTimeout(r, 3000));
-      }
-    }
-
-    const duration = Math.round((Date.now() - startTime) / 1000);
-    const finalData = loadData();
-
-    finalData.lastReviewRun = now;
-    finalData.reviewStats = {
-      lastRunAt: now,
-      lastRunReviewed: toReview.length,
-      lastRunFlagged: allNewFlags.length,
-      totalReviewed: Object.keys(finalData.reviewed).length,
-      totalFlagged: (finalData.flags || []).length,
-      lastRunDuration: `${Math.floor(duration / 60)}m ${duration % 60}s`
-    };
-    saveData(finalData);
-
-    console.log(`[AIReview] Complete — ${toReview.length} reviewed, ${allNewFlags.length} flagged in ${duration}s`);
-
-    res.json({
-      ok: true,
-      reviewed: toReview.length,
-      flagged: allNewFlags.length,
-      flags: finalData.flags || []
-    });
-  } catch (err) {
-    console.error('[AIReview] Run failed:', err.message);
-    next(err);
+// Fire-and-forget: returns immediately, job runs in background
+router.post('/run', (req, res) => {
+  if (runState.running) {
+    return res.json({ started: false, alreadyRunning: true, progress: runState.progress, phase: runState.phase });
   }
+  // Kick off background job — do NOT await
+  runReviewJob();
+  res.json({ started: true });
 });
 
 module.exports = router;
