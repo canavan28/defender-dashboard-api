@@ -53,7 +53,7 @@ function loadData() {
   } catch (err) {
     console.error('[AIReview] Error loading data file:', err.message);
   }
-  return { reviewed: {}, lastReviewRun: null, reviewStats: {}, exclusions: [], flags: [], trends: null };
+  return { reviewed: {}, lastReviewRun: null, reviewStats: {}, exclusions: [], flags: [], trends: null, prompts: {}, ignoredTrends: [] };
 }
 
 function saveData(data) {
@@ -549,6 +549,7 @@ router.get('/status', (req, res) => {
     exclusions: data.exclusions || [],
     trends: data.trends || null,
     prompts: data.prompts || {},
+    ignoredTrends: data.ignoredTrends || [],
     // Live run state for polling
     running: runState.running,
     runProgress: runState.progress,
@@ -619,6 +620,26 @@ router.post('/run', (req, res) => {
   // Kick off background job — do NOT await
   runReviewJob();
   res.json({ started: true });
+});
+
+router.post('/trends/ignore', (req, res) => {
+  const { key } = req.body;
+  if (!key) return res.status(400).json({ error: 'key required' });
+  const data = loadData();
+  if (!data.ignoredTrends) data.ignoredTrends = [];
+  if (!data.ignoredTrends.includes(key)) {
+    data.ignoredTrends.push(key);
+    saveData(data);
+  }
+  res.json({ ok: true, ignoredTrends: data.ignoredTrends });
+});
+
+router.delete('/trends/ignore/:key', (req, res) => {
+  const key = decodeURIComponent(req.params.key);
+  const data = loadData();
+  data.ignoredTrends = (data.ignoredTrends || []).filter(k => k !== key);
+  saveData(data);
+  res.json({ ok: true, ignoredTrends: data.ignoredTrends });
 });
 
 router.get('/prompts', (req, res) => {

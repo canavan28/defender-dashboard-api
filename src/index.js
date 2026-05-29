@@ -35,6 +35,19 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
+// TEMP — remove after checking
+app.get('/queues', async (req, res) => {
+  try {
+    const { autotaskClient } = require('./utils/autotask');
+    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
+    const fields = response.data.fields || [];
+    const queueField = fields.find(f => f.name === 'queueID');
+    res.json({ queues: queueField?.picklistValues || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Defender Dashboard API running on port ${PORT}`);
 });
