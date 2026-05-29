@@ -25,15 +25,14 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Temporary lookup routes
-app.get('/categories', async (req, res) => {
-  try {
-    const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
-    const fields = response.data.fields || [];
-    const catField = fields.find(f => f.name === 'ticketCategory');
-    res.json({ categories: catField?.picklistValues || [] });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+// TEMP — remove after checking
+app.get('/ticketsample', requireAuth, async (req, res) => {
+  const { autotaskClient } = require('./utils/autotask');
+  const response = await autotaskClient.post('/Tickets/query', {
+    filter: [{ field: 'status', op: 'eq', value: 5 }],
+    maxRecords: 1
+  });
+  res.json(response.data.items?.[0] || {});
 });
 
 app.get('/health', (req, res) => {
