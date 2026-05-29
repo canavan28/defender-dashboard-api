@@ -35,14 +35,19 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
-// TEMP — remove after checking
-app.get('/queues', async (req, res) => {
+// TEMP — remove after use
+app.post('/admin/reset-reviewed', async (req, res) => {
   try {
-    const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
-    const fields = response.data.fields || [];
-    const queueField = fields.find(f => f.name === 'queueID');
-    res.json({ queues: queueField?.picklistValues || [] });
+    const fs = require('fs');
+    const file = '/app/data/reviewed.json';
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const count = Object.keys(data.reviewed || {}).length;
+    data.reviewed = {};
+    data.trends = null;
+    data.reviewStats = {};
+    // Preserve flags, exclusions, prompts, ignoredTrends
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    res.json({ ok: true, clearedTickets: count, flagsPreserved: (data.flags || []).length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
