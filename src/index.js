@@ -25,23 +25,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// TEMP — remove after confirming field names
-app.get('/ticketsample', async (req, res) => {
-  try {
-    const { autotaskClient } = require('./utils/autotask');
-    const response = await autotaskClient.post('/Tickets/query', {
-      filter: [
-        { field: 'status', op: 'eq', value: 5 },
-        { field: 'completedDate', op: 'gte', value: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString() }
-      ],
-      maxRecords: 1
-    });
-    res.json(response.data.items?.[0] || {});
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 app.use('/api', verifyApiKey);
 app.use('/api/tickets', ticketsRouter);
 const aiReviewRouter = require('./routes/aireview');
