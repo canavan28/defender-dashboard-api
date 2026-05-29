@@ -128,7 +128,7 @@ async function fetchCompanyNames(companyIds) {
 }
 
 // ── Analyze a batch of tickets with Claude ────────────────────────────────────
-async function analyzeBatch(batch, companyMap) {
+async function analyzeBatch(batch, companyMap, customPrompt) {
   const ticketSummaries = batch.map(t => {
     const techIds = [t.assignedResourceID, t.completedByResourceID].filter(Boolean);
     const techInfo = techIds.map(id => {
@@ -165,42 +165,14 @@ async function analyzeBatch(batch, companyMap) {
     byCompany[t.companyId].push(t);
   });
 
-  const prompt = `You are reviewing IT support tickets for an MSP looking for issues needing executive attention.
-
-WHAT TO LOOK FOR:
-1. customer-health: Customer frustration, repeat issues, long resolution, multiple follow-ups
-2. cross-customer: Same issue type across multiple users at the same company
-3. escalation: Started with Tier 1 but required Tier 2 or Tier 3
-4. tech-performance: Unusually long resolution, misdiagnosis, confusing back-and-forth
-5. documentation: No notes, no resolution description
-6. reopen: Ticket reopened after closure
-
-SEVERITY:
-- critical: Immediate executive attention required
-- high: Review this week
-- medium: Review when time allows
-- low: Informational
-
-TICKETS:
-${JSON.stringify(ticketSummaries, null, 2)}
-
-COMPANY GROUPINGS:
-${JSON.stringify(Object.entries(byCompany).map(([id, tickets]) => ({
-    companyId: id,
-    ticketCount: tickets.length,
-    issueTypes: [...new Set(tickets.map(t => t.issueType))]
-  })), null, 2)}
-
-Return ONLY a JSON array of flagged tickets. If none warrant flagging return [].
-Each item must have:
-{
-  "ticketNumber": "T20260101.0001",
-  "severity": "critical|high|medium|low",
-  "flagType": "customer-health|cross-customer|escalation|tech-performance|documentation|reopen",
-  "summary": "One sentence summary",
-  "reasons": ["Reason 1", "Reason 2"],
-  "notesForExec": "Brief actionable note"
-}`;
+  const basePrompt = customPrompt || DEFAULT_TICKET_REVIEW_PROMPT;
+  const prompt = basePrompt
+    .replace('{{TICKETS}}', JSON.stringify(ticketSummaries, null, 2))
+    .replace('{{COMPANY_GROUPINGS}}', JSON.stringify(Object.entries(byCompany).map(([id, tickets]) => ({
+      companyId: id,
+      ticketCount: tickets.length,
+      issueTypes: [...new Set(tickets.map(t => t.issueType))]
+    })), null, 2));
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
     model: 'claude-sonnet-4-20250514',
@@ -225,7 +197,7 @@ Each item must have:
 }
 
 // ── Analyze trends across accumulated reviewed ticket metadata ─────────────────
-async function analyzeTrends(reviewedMetadata, companyMap) {
+async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
   console.log(`[AIReview] Running trend analysis on ${Object.keys(reviewedMetadata).length} reviewed tickets...`);
 
   // Build company-level summaries from metadata
@@ -320,52 +292,12 @@ async function analyzeTrends(reviewedMetadata, companyMap) {
     .filter(te => te.ticketCount >= 5)
     .sort((a, b) => b.flagRate - a.flagRate);
 
-  const prompt = `You are analyzing long-term patterns in IT support data for an MSP executive team.
-
-You have accumulated data from ticket reviews over the past 6 months. Identify meaningful patterns that warrant executive attention.
-
-LOOK FOR:
-1. COMPANY TRENDS: Companies with persistent issues over time, high flag rates, recurring issue types, or growing ticket volumes. Flag companies where the same problems keep appearing month after month.
-2. TECH PATTERNS: Technicians with high escalation rates on specific issue types, unusually long resolution times, or consistent flag patterns. Note both concerning patterns and strong performers.
-3. SENTIMENT SIGNALS: Companies showing signs of deteriorating relationship — high flag rates, long resolution times, escalations, repeat issues across multiple months.
-
-COMPANY DATA (${significantCompanies.length} companies with 3+ tickets):
-${JSON.stringify(significantCompanies, null, 2)}
-
-TECH DATA (${significantTechs.length} techs with 5+ tickets):
-${JSON.stringify(significantTechs, null, 2)}
-
-Return ONLY a JSON object with this exact structure:
-{
-  "companyTrends": [
-    {
-      "companyName": "Acme Corp",
-      "severity": "critical|high|medium|low",
-      "headline": "One sentence describing the pattern",
-      "details": ["Detail point 1", "Detail point 2"],
-      "recommendation": "What exec should do"
-    }
-  ],
-  "techPatterns": [
-    {
-      "techName": "Carlos Agundez",
-      "type": "concern|strength",
-      "headline": "One sentence describing the pattern",
-      "details": ["Detail point 1", "Detail point 2"],
-      "recommendation": "What exec should do"
-    }
-  ],
-  "sentimentSignals": [
-    {
-      "companyName": "Acme Corp",
-      "severity": "critical|high|medium|low",
-      "signal": "One sentence describing the sentiment concern",
-      "supportingData": ["Data point 1", "Data point 2"]
-    }
-  ]
-}
-
-Only include items with genuine patterns worth executive attention. Return empty arrays if nothing significant found.`;
+  const baseTrendPrompt = customPrompt || DEFAULT_TREND_ANALYSIS_PROMPT;
+  const prompt = baseTrendPrompt
+    .replace('{{COMPANY_COUNT}}', significantCompanies.length)
+    .replace('{{COMPANY_DATA}}', JSON.stringify(significantCompanies, null, 2))
+    .replace('{{TECH_COUNT}}', significantTechs.length)
+    .replace('{{TECH_DATA}}', JSON.stringify(significantTechs, null, 2));
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
     model: 'claude-sonnet-4-20250514',
@@ -485,7 +417,7 @@ async function runReviewJob() {
       let retries = 0;
       while (retries < 3) {
         try {
-          aiFlags = await analyzeBatch(batch, companyMap);
+          aiFlags = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null);
           break;
         } catch (err) {
           if (err.response?.status === 429 && retries < 2) {
@@ -576,7 +508,7 @@ async function runReviewJob() {
     runState = { ...runState, phase: 'Analyzing long-term trends', progress: 85 };
     const allCompanyIds = [...new Set(Object.values(reviewed).map(m => m?.companyID).filter(Boolean))];
     const allCompanyMap = await fetchCompanyNames(allCompanyIds);
-    const trends = await analyzeTrends(reviewed, allCompanyMap);
+    const trends = await analyzeTrends(reviewed, allCompanyMap, data.prompts?.trendAnalysis || null);
 
     const duration = Math.round((Date.now() - startTime) / 1000);
     const finalData = loadData();
@@ -616,6 +548,7 @@ router.get('/status', (req, res) => {
     flags: data.flags || [],
     exclusions: data.exclusions || [],
     trends: data.trends || null,
+    prompts: data.prompts || {},
     // Live run state for polling
     running: runState.running,
     runProgress: runState.progress,
@@ -686,6 +619,36 @@ router.post('/run', (req, res) => {
   // Kick off background job — do NOT await
   runReviewJob();
   res.json({ started: true });
+});
+
+router.get('/prompts', (req, res) => {
+  const data = loadData();
+  res.json({
+    ticketReview: data.prompts?.ticketReview || DEFAULT_TICKET_REVIEW_PROMPT,
+    trendAnalysis: data.prompts?.trendAnalysis || DEFAULT_TREND_ANALYSIS_PROMPT
+  });
+});
+
+router.post('/prompts', (req, res) => {
+  const { ticketReview, trendAnalysis } = req.body;
+  const data = loadData();
+  data.prompts = {
+    ticketReview: ticketReview || null,
+    trendAnalysis: trendAnalysis || null
+  };
+  saveData(data);
+  res.json({ ok: true, prompts: data.prompts });
+});
+
+router.post('/prompts/reset', (req, res) => {
+  const data = loadData();
+  data.prompts = {};
+  saveData(data);
+  res.json({
+    ok: true,
+    ticketReview: DEFAULT_TICKET_REVIEW_PROMPT,
+    trendAnalysis: DEFAULT_TREND_ANALYSIS_PROMPT
+  });
 });
 
 module.exports = router;
