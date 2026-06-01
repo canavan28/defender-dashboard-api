@@ -223,7 +223,7 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
     byCompany[t.companyId].push(t);
   });
 
-  const basePrompt = customPrompt || DEFAULT_TICKET_REVIEW_PROMPT;
+  const basePrompt = (customPrompt && customPrompt.trim()) ? customPrompt : DEFAULT_TICKET_REVIEW_PROMPT;
   const prompt = basePrompt
     .replace('{{TICKETS}}', JSON.stringify(ticketSummaries, null, 2))
     .replace('{{COMPANY_GROUPINGS}}', JSON.stringify(Object.entries(byCompany).map(([id, tickets]) => ({
@@ -234,7 +234,7 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
+    max_tokens: 4000,
     messages: [{ role: 'user', content: prompt }]
   }, {
     headers: {
@@ -249,7 +249,11 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
     const clean = content.replace(/```json|```/g, '').trim();
     return JSON.parse(clean);
   } catch (err) {
-    console.error('[AIReview] Failed to parse Claude response:', err.message);
+    if (err.response) {
+      console.error('[AIReview] Claude API error:', err.response.status, JSON.stringify(err.response.data));
+    } else {
+      console.error('[AIReview] Failed to parse Claude response:', err.message);
+    }
     return [];
   }
 }
@@ -350,7 +354,7 @@ async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
     .filter(te => te.ticketCount >= 5)
     .sort((a, b) => b.flagRate - a.flagRate);
 
-  const baseTrendPrompt = customPrompt || DEFAULT_TREND_ANALYSIS_PROMPT;
+  const baseTrendPrompt = (customPrompt && customPrompt.trim()) ? customPrompt : DEFAULT_TREND_ANALYSIS_PROMPT;
   const prompt = baseTrendPrompt
     .replace('{{COMPANY_COUNT}}', significantCompanies.length)
     .replace('{{COMPANY_DATA}}', JSON.stringify(significantCompanies, null, 2))
@@ -473,20 +477,26 @@ async function runReviewJob() {
 
       let aiFlags = [];
       let retries = 0;
+      let batchSucceeded = false;
       while (retries < 3) {
         try {
           aiFlags = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null);
+          batchSucceeded = true;
           break;
         } catch (err) {
-          if (err.response?.status === 429 && retries < 2) {
-            console.log(`[AIReview] Rate limited, waiting 30s before retry ${retries + 1}...`);
-            await new Promise(r => setTimeout(r, 30000));
+          if (err.response?.status === 429) {
+            const waitSecs = [60, 90, 120][retries] || 120;
+            console.log(`[AIReview] Rate limited on batch ${i + 1}, waiting ${waitSecs}s before retry ${retries + 1}...`);
+            await new Promise(r => setTimeout(r, waitSecs * 1000));
             retries++;
           } else {
             console.error(`[AIReview] Batch ${i + 1} failed:`, err.message);
             break;
           }
         }
+      }
+      if (!batchSucceeded) {
+        console.warn(`[AIReview] Batch ${i + 1} skipped after ${retries} retries — marking tickets as reviewed without flags`);
       }
 
       // Mark batch as reviewed with richer metadata
@@ -558,7 +568,7 @@ async function runReviewJob() {
       saveData(data);
 
       if (i < batches.length - 1) {
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 8000)); // 8s between batches to respect rate limit
       }
     }
 
