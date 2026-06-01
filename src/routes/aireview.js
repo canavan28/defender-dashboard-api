@@ -21,6 +21,64 @@ const TECH_TIERS = {
   29682899: { name: 'Chris McDaniel', tier: 3 }
 };
 
+// ── Default prompts ───────────────────────────────────────────────────────────
+const DEFAULT_TICKET_REVIEW_PROMPT = `You are reviewing IT support tickets for an MSP looking for issues needing executive attention.
+
+WHAT TO LOOK FOR:
+1. customer-health: Customer frustration, repeat issues, long resolution, multiple follow-ups
+2. cross-customer: Same issue type across multiple users at the same company
+3. escalation: Started with Tier 1 but required Tier 2 or Tier 3
+4. tech-performance: Unusually long resolution, misdiagnosis, confusing back-and-forth
+5. documentation: No notes, no resolution description
+6. reopen: Ticket reopened after closure
+
+SEVERITY:
+- critical: Immediate executive attention required
+- high: Review this week
+- medium: Review when time allows
+- low: Informational
+
+TICKETS:
+{{TICKETS}}
+
+COMPANY GROUPINGS:
+{{COMPANY_GROUPINGS}}
+
+Return ONLY a JSON array of flagged tickets. If none warrant flagging return [].
+Each item must have:
+{
+  "ticketNumber": "T20260101.0001",
+  "severity": "critical|high|medium|low",
+  "flagType": "customer-health|cross-customer|escalation|tech-performance|documentation|reopen",
+  "summary": "One sentence summary",
+  "reasons": ["Reason 1", "Reason 2"],
+  "notesForExec": "Brief actionable note"
+}`;
+
+const DEFAULT_TREND_ANALYSIS_PROMPT = `You are analyzing long-term patterns in IT support data for an MSP executive team.
+
+You have accumulated data from ticket reviews over the past 6 months. Identify meaningful patterns that warrant executive attention.
+
+LOOK FOR:
+1. COMPANY TRENDS: Companies with persistent issues over time, high flag rates, recurring issue types, or growing ticket volumes. Flag companies where the same problems keep appearing month after month.
+2. TECH PATTERNS: Technicians with high escalation rates on specific issue types, unusually long resolution times, or consistent flag patterns. Note both concerning patterns and strong performers.
+3. SENTIMENT SIGNALS: Companies showing signs of deteriorating relationship - high flag rates, long resolution times, escalations, repeat issues across multiple months.
+
+COMPANY DATA ({{COMPANY_COUNT}} companies with 3+ tickets):
+{{COMPANY_DATA}}
+
+TECH DATA ({{TECH_COUNT}} techs with 5+ tickets):
+{{TECH_DATA}}
+
+Return ONLY a JSON object with this exact structure:
+{
+  "companyTrends": [{"companyName": "Acme Corp","severity": "critical|high|medium|low","headline": "One sentence describing the pattern","details": ["Detail point 1"],"recommendation": "What exec should do"}],
+  "techPatterns": [{"techName": "Carlos Agundez","type": "concern|strength","headline": "One sentence describing the pattern","details": ["Detail point 1"],"recommendation": "What exec should do"}],
+  "sentimentSignals": [{"companyName": "Acme Corp","severity": "critical|high|medium|low","signal": "One sentence describing the sentiment concern","supportingData": ["Data point 1"]}]
+}
+
+Only include items with genuine patterns worth executive attention. Return empty arrays if nothing significant found.`;
+
 // ── In-memory run state (for fire-and-forget polling) ─────────────────────────
 let runState = {
   running: false,
