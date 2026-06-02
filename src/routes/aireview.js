@@ -232,17 +232,27 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
       issueTypes: [...new Set(tickets.map(t => t.issueType))]
     })), null, 2));
 
-  const response = await axios.post('https://api.anthropic.com/v1/messages', {
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4000,
-    messages: [{ role: 'user', content: prompt }]
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'x-api-key': process.env.ANTHROPIC_API_KEY
+  let response;
+  try {
+    response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      messages: [{ role: 'user', content: prompt }]
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': process.env.ANTHROPIC_API_KEY
+      }
+    });
+  } catch (err) {
+    if (err.response) {
+      console.error('[AIReview] Claude API error:', err.response.status, JSON.stringify(err.response.data));
+      console.error('[AIReview] Prompt length (chars):', prompt.length);
+      console.error('[AIReview] First 500 chars of prompt:', prompt.substring(0, 500));
     }
-  });
+    throw err; // re-throw so retry logic handles it
+  }
 
   try {
     const content = response.data.content[0]?.text || '[]';
@@ -361,17 +371,26 @@ async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
     .replace('{{TECH_COUNT}}', significantTechs.length)
     .replace('{{TECH_DATA}}', JSON.stringify(significantTechs, null, 2));
 
-  const response = await axios.post('https://api.anthropic.com/v1/messages', {
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 3000,
-    messages: [{ role: 'user', content: prompt }]
-  }, {
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'x-api-key': process.env.ANTHROPIC_API_KEY
+  let response;
+  try {
+    response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 3000,
+      messages: [{ role: 'user', content: prompt }]
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'x-api-key': process.env.ANTHROPIC_API_KEY
+      }
+    });
+  } catch (err) {
+    if (err.response) {
+      console.error('[AIReview Trends] Claude API error:', err.response.status, JSON.stringify(err.response.data));
+      console.error('[AIReview Trends] Prompt length (chars):', prompt.length);
     }
-  });
+    throw err;
+  }
 
   try {
     const content = response.data.content[0]?.text || '{}';
