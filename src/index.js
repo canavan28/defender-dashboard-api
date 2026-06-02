@@ -36,21 +36,16 @@ app.use((err, req, res, next) => {
 });
 
 // TEMP — remove after use
-app.post('/admin/reset-reviewed', async (req, res) => {
-  try {
-    const fs = require('fs');
-    const file = '/app/data/reviewed.json';
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const count = Object.keys(data.reviewed || {}).length;
-    data.reviewed = {};
-    data.trends = null;
-    data.reviewStats = {};
-    // Preserve flags, exclusions, prompts, ignoredTrends
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-    res.json({ ok: true, clearedTickets: count, flagsPreserved: (data.flags || []).length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.post('/admin/reset-reviewed', (req, res) => {
+  const fs = require('fs');
+  const file = '/app/data/reviewed.json';
+  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const count = Object.keys(data.reviewed || {}).length;
+  data.reviewed = {};
+  data.trends = null;
+  data.reviewStats = {};
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  res.json({ ok: true, clearedTickets: count, flagsPreserved: (data.flags || []).length });
 });
 
 app.listen(PORT, () => {
