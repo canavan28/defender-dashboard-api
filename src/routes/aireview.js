@@ -11,6 +11,7 @@ const AUTOTASK_ZONE = (process.env.AUTOTASK_ZONE_URL || '').replace('/ATServices
 // ── Constants ─────────────────────────────────────────────────────────────────
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
 const EXCLUDE_CATEGORIES = new Set([104]); // 104 = LUV Credit Card Requests
+const FLAG_WINDOW_DAYS = 60; // Only flag tickets created within this many days
 
 const TECH_TIERS = {
   29682924: { name: 'Carlos Agundez', tier: 1 },
@@ -542,9 +543,16 @@ async function runReviewJob() {
         };
       });
 
-      // Build flag objects
+      // Build flag objects — only for tickets created within FLAG_WINDOW_DAYS
+      const flagCutoff = new Date();
+      flagCutoff.setDate(flagCutoff.getDate() - FLAG_WINDOW_DAYS);
       aiFlags.forEach(f => {
         const ticket = batch.find(t => t.ticketNumber === f.ticketNumber);
+        // Skip adding to flags if ticket is older than the flag window
+        if (ticket?.createDate && new Date(ticket.createDate) < flagCutoff) {
+          console.log(`[AIReview] Ticket ${f.ticketNumber} flagged but outside ${FLAG_WINDOW_DAYS}-day window — stored in metadata only`);
+          return;
+        }
         const companyName = ticket ? (companyMap[String(ticket.companyID)] || 'Unknown Company') : 'Unknown Company';
         allNewFlags.push({
           id: f.ticketNumber,
@@ -727,6 +735,15 @@ router.delete('/trends/ignore/:key', (req, res) => {
   data.ignoredTrends = (data.ignoredTrends || []).filter(k => k !== key);
   saveData(data);
   res.json({ ok: true, ignoredTrends: data.ignoredTrends });
+});
+
+// Admin route — clear all flags (keep reviewed metadata for trend analysis)
+router.post('/admin/clear-flags', (req, res) => {
+  const data = loadData();
+  const count = (data.flags || []).length;
+  data.flags = [];
+  saveData(data);
+  res.json({ ok: true, clearedFlags: count });
 });
 
 router.get('/prompts', (req, res) => {
