@@ -633,6 +633,197 @@ async function runReviewJob() {
   }
 }
 
+
+// ── Analyze individual tech performance holistically ──────────────────────────
+async function analyzeTechPerformance(techId, techName, allTickets, timeEntries, reviewedMeta) {
+  console.log(`[TechAnalysis] Analyzing ${techName} (${techId})...`);
+
+  const TECH_TIERS_LOCAL = {
+    29682924: 1, 29682927: 1,
+    29682910: 2, 29682889: 2,
+    29682904: 3, 29682899: 3
+  };
+
+  // Filter tickets assigned to this tech
+  const techTickets = allTickets.filter(t => t.assignedResourceID === techId);
+  if (techTickets.length < 10) {
+    return { error: 'Insufficient ticket history for analysis (need 10+)' };
+  }
+
+  // Build time entry map
+  const ticketHoursMap = {};
+  timeEntries.forEach(te => {
+    if (te.resourceID === techId && te.ticketID) {
+      ticketHoursMap[te.ticketID] = (ticketHoursMap[te.ticketID] || 0) + (te.hoursWorked || 0);
+    }
+  });
+
+  // Group tickets by quarter
+  const quarterData = {};
+  techTickets.forEach(t => {
+    if (!t.createDate) return;
+    const d = new Date(t.createDate);
+    const q = Math.floor(d.getMonth() / 3) + 1;
+    const key = `${d.getFullYear()}-Q${q}`;
+    if (!quarterData[key]) quarterData[key] = {
+      tickets: [], responseTimes: [], hoursLogged: [],
+      escalations: 0, docFlags: 0, oneTouchYes: 0, oneTouchTotal: 0,
+      slaBreaches: 0, slaEligible: 0
+    };
+    const qd = quarterData[key];
+    qd.tickets.push(t);
+
+    // Response time (excl low priority + internal)
+    if (t.createDate && t.firstResponseDateTime && t.priority !== 4 && t.companyID !== 0) {
+      const hrs = (new Date(t.firstResponseDateTime) - new Date(t.createDate)) / (1000 * 60 * 60);
+      if (hrs >= 0 && hrs < 720) qd.responseTimes.push(hrs);
+    }
+
+    // Hours logged on completed tickets
+    if (t.completedDate && ticketHoursMap[t.id] != null) {
+      qd.hoursLogged.push(ticketHoursMap[t.id]);
+    }
+
+    // Escalation
+    const assignedTier = TECH_TIERS_LOCAL[techId] || null;
+    if (t.completedByResourceID && t.completedByResourceID !== techId) {
+      const completedTier = TECH_TIERS_LOCAL[t.completedByResourceID];
+      if (assignedTier && completedTier && completedTier > assignedTier) {
+        qd.escalations++;
+      }
+    }
+
+    // SLA
+    if (t.firstResponseDueDateTime) {
+      qd.slaEligible++;
+      if (!t.firstResponseDateTime || new Date(t.firstResponseDateTime) > new Date(t.firstResponseDueDateTime)) {
+        qd.slaBreaches++;
+      }
+    }
+
+    // FCR
+    const oneTouchField = t.userDefinedFields?.find(f => f.name === 'Is One Touch Close');
+    if (oneTouchField) {
+      qd.oneTouchTotal++;
+      if (oneTouchField.value === 'Yes') qd.oneTouchYes++;
+    }
+
+    // Doc flags from reviewed metadata
+    if (reviewedMeta[t.ticketNumber]?.flagType === 'documentation') {
+      qd.docFlags++;
+    }
+  });
+
+  // Compute per-quarter summaries
+  const quarters = Object.keys(quarterData).sort();
+  const quarterSummaries = quarters.map(key => {
+    const qd = quarterData[key];
+    const avgResponseMins = qd.responseTimes.length
+      ? Math.round((qd.responseTimes.reduce((a, b) => a + b, 0) / qd.responseTimes.length) * 60) : null;
+    const avgResolutionMins = qd.hoursLogged.length
+      ? Math.round((qd.hoursLogged.reduce((a, b) => a + b, 0) / qd.hoursLogged.length) * 60) : null;
+    const fcrRate = qd.oneTouchTotal > 0
+      ? Math.round((qd.oneTouchYes / qd.oneTouchTotal) * 100) : null;
+    const slaBreachRate = qd.slaEligible > 0
+      ? Math.round((qd.slaBreaches / qd.slaEligible) * 100) : null;
+    const notesIssueRate = qd.tickets.length > 0
+      ? Math.round((qd.docFlags / qd.tickets.length) * 100) : null;
+    return {
+      quarter: key,
+      ticketCount: qd.tickets.length,
+      avgResponseMins,
+      avgResolutionMins,
+      escalations: qd.escalations,
+      slaBreachRate,
+      fcrRate,
+      notesIssueRate
+    };
+  });
+
+  // QoQ comparison — current vs prior quarter
+  const now = new Date();
+  const currentQ = Math.floor(now.getMonth() / 3) + 1;
+  const currentQKey = `${now.getFullYear()}-Q${currentQ}`;
+  const priorQNum = currentQ === 1 ? 4 : currentQ - 1;
+  const priorQYear = currentQ === 1 ? now.getFullYear() - 1 : now.getFullYear();
+  const priorQKey = `${priorQYear}-Q${priorQNum}`;
+
+  const currentQData = quarterSummaries.find(q => q.quarter === currentQKey);
+  const priorQData = quarterSummaries.find(q => q.quarter === priorQKey);
+
+  // Send to Claude for narrative
+  const prompt = `You are writing a performance summary for an IT support technician at an MSP, for executive review.
+
+TECHNICIAN: ${techName}
+TIER: ${TECH_TIERS_LOCAL[techId] ? `Tier ${TECH_TIERS_LOCAL[techId]}` : 'Unknown'}
+
+QUARTERLY PERFORMANCE DATA (last ${quarters.length} quarters):
+${JSON.stringify(quarterSummaries, null, 2)}
+
+CURRENT QUARTER (${currentQKey}):
+${JSON.stringify(currentQData || 'No data yet', null, 2)}
+
+PRIOR QUARTER (${priorQKey}):
+${JSON.stringify(priorQData || 'No data yet', null, 2)}
+
+METRIC DEFINITIONS:
+- avgResponseMins: Average minutes from ticket creation to first response (lower = better, exclude low priority)
+- avgResolutionMins: Average minutes of logged work on completed tickets (lower = better)
+- escalations: Number of tickets escalated to a higher tier tech (context dependent)
+- slaBreachRate: % of tickets where first response exceeded SLA deadline (lower = better)
+- fcrRate: % of tickets closed as one-touch (higher = better, target 90%+)
+- notesIssueRate: % of tickets flagged by AI for documentation issues (lower = better)
+
+Write a concise executive performance summary with:
+1. STRENGTHS: 2-3 specific things this tech does well based on the data
+2. CONCERNS: 2-3 specific areas needing attention (if any)
+3. TRENDS: What direction are their key metrics heading quarter over quarter?
+4. RECOMMENDATION: One clear action item for management
+
+Keep each section to 2-3 sentences. Be specific and data-driven. If data is insufficient for a section, say so briefly.
+
+Return ONLY a JSON object:
+{
+  "strengths": "paragraph text",
+  "concerns": "paragraph text or 'No significant concerns identified.'",
+  "trends": "paragraph text",
+  "recommendation": "one clear sentence"
+}`;
+
+  const response = await axios.post('https://api.anthropic.com/v1/messages', {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    messages: [{ role: 'user', content: prompt }]
+  }, {
+    headers: {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': process.env.ANTHROPIC_API_KEY
+    }
+  });
+
+  let narrative = { strengths: '', concerns: '', trends: '', recommendation: '' };
+  try {
+    const text = response.data.content[0]?.text || '{}';
+    const clean = text.replace(/```json|```/g, '').trim();
+    narrative = JSON.parse(clean);
+  } catch (err) {
+    console.error('[TechAnalysis] Failed to parse narrative:', err.message);
+  }
+
+  return {
+    techId,
+    techName,
+    generatedAt: new Date().toISOString(),
+    narrative,
+    quarterSummaries,
+    currentQKey,
+    priorQKey,
+    currentQ: currentQData || null,
+    priorQ: priorQData || null
+  };
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 router.get('/status', (req, res) => {
@@ -738,6 +929,74 @@ router.delete('/trends/ignore/:key', (req, res) => {
 });
 
 // Admin route — clear all flags (keep reviewed metadata for trend analysis)
+router.get('/tech-analysis', (req, res) => {
+  const data = loadData();
+  res.json({ techAnalysis: data.techAnalysis || {} });
+});
+
+router.post('/analyze-tech', async (req, res, next) => {
+  const { techId } = req.body;
+  if (!techId) return res.status(400).json({ error: 'techId required' });
+
+  try {
+    // Load ticket caches
+    const fs = require('fs');
+    const historicalCache = fs.existsSync('/app/data/tickets-historical.json')
+      ? JSON.parse(fs.readFileSync('/app/data/tickets-historical.json', 'utf8')) : {};
+    const recentCache = fs.existsSync('/app/data/tickets-recent.json')
+      ? JSON.parse(fs.readFileSync('/app/data/tickets-recent.json', 'utf8')) : {};
+
+    // Merge tickets
+    const ticketMap = {};
+    [...(historicalCache.allTickets || []), ...(recentCache.allTickets || [])].forEach(t => {
+      ticketMap[t.id] = t;
+    });
+    const allTickets = Object.values(ticketMap);
+
+    // Load time entries
+    const histTE = fs.existsSync('/app/data/tickets-historical.json')
+      ? [] : []; // time entries are in memory only, use reviewed meta instead
+    const { autotaskClient } = require('../utils/autotask');
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+    // Fetch time entries for this tech
+    const teResponse = await autotaskClient.post('/TimeEntries/query', {
+      filter: [
+        { field: 'resourceID', op: 'eq', value: techId },
+        { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
+        { field: 'ticketID', op: 'exist' }
+      ],
+      maxRecords: 500
+    });
+    const timeEntries = teResponse.data.items || [];
+
+    // Load reviewed metadata
+    const data = loadData();
+    const reviewedMeta = data.reviewed || {};
+
+    // Find tech name from TECH_TIERS
+    const techInfo = Object.entries({
+      29682924: 'Carlos Agundez', 29682927: 'Ben Holliday',
+      29682910: 'Brandon Emby', 29682889: 'Matt Cartrett',
+      29682904: 'Rob Coleman', 29682899: 'Chris McDaniel'
+    }).find(([id]) => parseInt(id) === parseInt(techId));
+    const techName = techInfo?.[1] || `Tech ${techId}`;
+
+    const result = await analyzeTechPerformance(parseInt(techId), techName, allTickets, timeEntries, reviewedMeta);
+
+    // Store result
+    if (!data.techAnalysis) data.techAnalysis = {};
+    data.techAnalysis[techId] = result;
+    saveData(data);
+
+    res.json({ ok: true, analysis: result });
+  } catch (err) {
+    console.error('[TechAnalysis] Failed:', err.message);
+    next(err);
+  }
+});
+
 router.post('/admin/clear-flags', (req, res) => {
   const data = loadData();
   const count = (data.flags || []).length;
