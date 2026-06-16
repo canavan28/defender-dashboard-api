@@ -288,6 +288,8 @@ async function fetchCompanyNames(companyIds) {
   } catch (err) {
     console.warn('[Companies] Could not fetch company names:', err.message);
   }
+  // companyID 0 is InfoTank's own internal tickets — not a real AutoTask company record
+  companyMap['0'] = 'InfoTank (Internal)';
   return companyMap;
 }
 
