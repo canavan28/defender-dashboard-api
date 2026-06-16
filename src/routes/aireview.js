@@ -12,6 +12,7 @@ const AUTOTASK_ZONE = (process.env.AUTOTASK_ZONE_URL || '').replace('/ATServices
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
 const EXCLUDE_CATEGORIES = new Set([104]); // 104 = LUV Credit Card Requests
 const FLAG_WINDOW_DAYS = 60; // Only flag tickets created within this many days
+const CLAUDE_MODEL = 'claude-opus-4-6';
 
 const TECH_TIERS = {
   29682924: { name: 'Carlos Agundez', tier: 1 },
@@ -236,7 +237,7 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
   let response;
   try {
     response = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-20250514',
+      model: CLAUDE_MODEL,
       max_tokens: 4000,
       messages: [{ role: 'user', content: prompt }]
     }, {
@@ -375,7 +376,7 @@ async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
   let response;
   try {
     response = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: 'claude-sonnet-4-20250514',
+      model: CLAUDE_MODEL,
       max_tokens: 3000,
       messages: [{ role: 'user', content: prompt }]
     }, {
@@ -477,8 +478,8 @@ async function runReviewJob() {
     const companyIds = [...new Set(toReview.map(t => t.companyID).filter(Boolean))];
     const companyMap = await fetchCompanyNames(companyIds);
 
-    // Process in batches of 50
-    const BATCH_SIZE = 50;
+    // Process in batches of 25
+    const BATCH_SIZE = 25;
     const batches = [];
     for (let i = 0; i < toReview.length; i += BATCH_SIZE) {
       batches.push(toReview.slice(i, i + BATCH_SIZE));
@@ -488,6 +489,7 @@ async function runReviewJob() {
 
     const allNewFlags = [];
     const now = new Date().toISOString();
+    let totalSkippedTickets = 0;
 
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
@@ -515,11 +517,20 @@ async function runReviewJob() {
           }
         }
       }
+
       if (!batchSucceeded) {
-        console.warn(`[AIReview] Batch ${i + 1} skipped after ${retries} retries — marking tickets as reviewed without flags`);
+        // IMPORTANT: do NOT mark these tickets as reviewed — leave them unreviewed
+        // so they get retried on the next AI Review run instead of being silently lost.
+        console.warn(`[AIReview] Batch ${i + 1} failed after ${retries} retries — leaving ${batch.length} tickets unreviewed for retry next run`);
+        totalSkippedTickets += batch.length;
+
+        if (i < batches.length - 1) {
+          await new Promise(r => setTimeout(r, 8000));
+        }
+        continue; // skip marking-as-reviewed and flag-building for this batch entirely
       }
 
-      // Mark batch as reviewed with richer metadata
+      // Mark batch as reviewed with richer metadata (only runs if batch succeeded)
       batch.forEach(t => {
         const techIds = [t.assignedResourceID, t.completedByResourceID].filter(Boolean);
         const wasEscalated = techIds.length > 1 &&
@@ -599,6 +610,10 @@ async function runReviewJob() {
       }
     }
 
+    if (totalSkippedTickets > 0) {
+      console.warn(`[AIReview] ${totalSkippedTickets} tickets left unreviewed due to batch failures — will retry on next run`);
+    }
+
     // Run trend analysis on all accumulated metadata
     runState = { ...runState, phase: 'Analyzing long-term trends', progress: 85 };
     const allCompanyIds = [...new Set(Object.values(reviewed).map(m => m?.companyID).filter(Boolean))];
@@ -611,7 +626,8 @@ async function runReviewJob() {
     finalData.lastReviewRun = now;
     finalData.reviewStats = {
       lastRunAt: now,
-      lastRunReviewed: toReview.length,
+      lastRunReviewed: toReview.length - totalSkippedTickets,
+      lastRunSkipped: totalSkippedTickets,
       lastRunFlagged: allNewFlags.length,
       totalReviewed: Object.keys(finalData.reviewed).length,
       totalFlagged: (finalData.flags || []).length,
@@ -624,7 +640,7 @@ async function runReviewJob() {
     };
     saveData(finalData);
 
-    console.log(`[AIReview] Complete — ${toReview.length} reviewed, ${allNewFlags.length} flagged in ${duration}s`);
+    console.log(`[AIReview] Complete — ${toReview.length - totalSkippedTickets} reviewed, ${totalSkippedTickets} skipped for retry, ${allNewFlags.length} flagged in ${duration}s`);
     runState = { running: false, progress: 100, phase: 'Complete', startedAt: runState.startedAt, error: null };
 
   } catch (err) {
@@ -791,7 +807,7 @@ Return ONLY a JSON object:
 }`;
 
   const response = await axios.post('https://api.anthropic.com/v1/messages', {
-    model: 'claude-sonnet-4-20250514',
+    model: CLAUDE_MODEL,
     max_tokens: 1000,
     messages: [{ role: 'user', content: prompt }]
   }, {
@@ -953,9 +969,6 @@ router.post('/analyze-tech', async (req, res, next) => {
     });
     const allTickets = Object.values(ticketMap);
 
-    // Load time entries
-    const histTE = fs.existsSync('/app/data/tickets-historical.json')
-      ? [] : []; // time entries are in memory only, use reviewed meta instead
     const { autotaskClient } = require('../utils/autotask');
     const sixMonthsAgo = new Date();
     sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
@@ -1003,6 +1016,30 @@ router.post('/admin/clear-flags', (req, res) => {
   data.flags = [];
   saveData(data);
   res.json({ ok: true, clearedFlags: count });
+});
+
+// Admin route — clear reviewed entries from a specific date forward (to fix
+// tickets that were incorrectly marked "reviewed" during the model outage)
+router.post('/admin/reset-reviewed-since', (req, res) => {
+  const { since } = req.body; // ISO date string
+  if (!since) return res.status(400).json({ error: 'since (ISO date) required' });
+  const cutoff = new Date(since);
+  const data = loadData();
+  let cleared = 0;
+  let kept = 0;
+  const newReviewed = {};
+  Object.entries(data.reviewed || {}).forEach(([ticketNum, meta]) => {
+    const reviewedAt = meta?.reviewedAt ? new Date(meta.reviewedAt) : null;
+    if (reviewedAt && reviewedAt >= cutoff) {
+      cleared++;
+    } else {
+      newReviewed[ticketNum] = meta;
+      kept++;
+    }
+  });
+  data.reviewed = newReviewed;
+  saveData(data);
+  res.json({ ok: true, clearedReviewed: cleared, kept, cutoff: cutoff.toISOString() });
 });
 
 router.get('/prompts', (req, res) => {
