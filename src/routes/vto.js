@@ -147,6 +147,51 @@ router.post('/', (req, res) => {
   }
 });
 
+// POST /api/vto/import — backfill a historical VTO from a complete,
+// already-assembled VTO object (e.g. hand-built from an old Word doc).
+// Skips pre-fill logic entirely; writes exactly what's given. Marks the
+// record final by default, since this is for past, already-decided years,
+// not an in-progress draft. Body: { vto: <full VTO object>, overwrite?: bool }
+router.post('/import', (req, res) => {
+  try {
+    const { vto, overwrite } = req.body;
+
+    if (!vto || typeof vto !== 'object') {
+      return res.status(400).json({ error: 'vto (object) is required' });
+    }
+    if (!vto.id || !vto.year || !vto.vision || !vto.traction) {
+      return res.status(400).json({ error: 'vto must include at minimum: id, year, vision, traction' });
+    }
+
+    const store = loadStore();
+    if (store.vtos[vto.id] && !overwrite) {
+      return res.status(409).json({ error: `${vto.id} already exists. Pass overwrite: true to replace it.` });
+    }
+
+    const now = new Date().toISOString();
+    const record = {
+      // Sensible defaults for anything the import payload omits, so a
+      // slightly incomplete paste still produces a valid, browsable record.
+      label: `FY${vto.year} Vision/Traction`,
+      savedDate: null,
+      status: 'final',
+      authoredBy: '',
+      createdAt: now,
+      ...vto,
+      updatedAt: now,
+    };
+
+    store.vtos[record.id] = record;
+    saveStore(store);
+
+    console.warn(`[VTO] ${req.user.name || req.user.oid} imported historical record ${record.id}`);
+
+    res.status(201).json(record);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATCH /api/vto/:id — update one field path (autosave-friendly)
 // Body: { path: string[], value: any }
 // Locked (finalized) VTOs reject edits unless explicitly unlocked first.
