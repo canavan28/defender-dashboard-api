@@ -263,4 +263,31 @@ router.post('/:id/unlock', (req, res) => {
   }
 });
 
+// DELETE /api/vto/:id — permanently remove a VTO record.
+// Finalized (historical) records require ?force=true to delete, since
+// those represent real past-meeting decisions — deleting one should be a
+// deliberate, harder action than deleting an in-progress draft.
+router.delete('/:id', (req, res) => {
+  try {
+    const store = loadStore();
+    const existing = store.vtos[req.params.id];
+    if (!existing) return res.status(404).json({ error: 'VTO not found' });
+
+    if (existing.status === 'final' && req.query.force !== 'true') {
+      return res.status(409).json({
+        error: `${req.params.id} is finalized. Add ?force=true to the request to delete a finalized historical record.`
+      });
+    }
+
+    delete store.vtos[req.params.id];
+    saveStore(store);
+
+    console.warn(`[VTO] ${req.user.name || req.user.oid} deleted ${req.params.id} (was status: ${existing.status})`);
+
+    res.json({ ok: true, deleted: req.params.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
