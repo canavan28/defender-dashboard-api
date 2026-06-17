@@ -75,6 +75,19 @@ function newDraftFrom(prev, year) {
       },
       issues: [...(prev?.traction?.issues || [])],
     },
+    // Reference-only copies of last year's four snapshot blocks. The actual
+    // current/twoYear/threeYear/oneYear fields above stay blank on purpose
+    // (these get freshly re-assessed each year) -- this is just last year's
+    // numbers for the frontend to display alongside the blank fields, e.g.
+    // "Last year: $1.86M ($155k/mo)" next to an empty Gross Profit input.
+    // Never edited directly; not part of the "real" document fields.
+    prevSnapshots: prev ? {
+      current: prev.vision?.current ? { ...prev.vision.current } : null,
+      twoYear: prev.vision?.twoYear ? { ...prev.vision.twoYear } : null,
+      threeYear: prev.vision?.threeYear ? { ...prev.vision.threeYear } : null,
+      oneYear: prev.traction?.oneYear ? { ...prev.traction.oneYear } : null,
+      sourceYear: prev.year,
+    } : null,
   };
 }
 
