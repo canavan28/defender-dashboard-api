@@ -2,7 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const ticketsRouter = require('./routes/tickets');
-const { verifyApiKey } = require('./middleware/auth');
+const aiReviewRouter = require('./routes/aireview');
+const vtoRouter = require('./routes/vto');
+const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -14,7 +16,7 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
-  methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
 }));
@@ -26,77 +28,21 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api', verifyApiKey);
+
+app.get('/api/me', (req, res) => {
+  res.json({ oid: req.user.oid, name: req.user.name, email: req.user.email, isOwner: req.user.isOwner });
+});
+
 app.use('/api/tickets', ticketsRouter);
-const aiReviewRouter = require('./routes/aireview');
 app.use('/api/aireview', aiReviewRouter);
+app.use('/api/vto', vtoRouter);
 
-app.use((err, req, res, next) => {
-  console.error('[Error]', err.message);
-  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
-});
-
-// TEMP — remove after use
-app.post('/admin/clear-flags', async (req, res) => {
-  try {
-    const fs = require('fs');
-    const data = JSON.parse(fs.readFileSync('/app/data/reviewed.json', 'utf8'));
-    const count = (data.flags || []).length;
-    data.flags = [];
-    fs.writeFileSync('/app/data/reviewed.json', JSON.stringify(data, null, 2));
-    res.json({ ok: true, clearedFlags: count });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// TEMP — remove after use
-// Clears reviewed entries for tickets reviewed in last 60 days using reviewedAt timestamp
-// Older entries kept intact for trend analysis
-app.post('/admin/reset-recent-reviewed', async (req, res) => {
-  try {
-    const fs = require('fs');
-    const reviewedFile = '/app/data/reviewed.json';
-    const data = JSON.parse(fs.readFileSync(reviewedFile, 'utf8'));
-
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 60);
-
-    let cleared = 0;
-    let kept = 0;
-    const newReviewed = {};
-
-    Object.entries(data.reviewed || {}).forEach(([ticketNum, meta]) => {
-      const reviewedAt = meta?.reviewedAt ? new Date(meta.reviewedAt) : null;
-      if (reviewedAt && reviewedAt >= cutoff) {
-        cleared++;
-      } else {
-        newReviewed[ticketNum] = meta;
-        kept++;
-      }
-    });
-
-    data.reviewed = newReviewed;
-    data.flags = [];
-    fs.writeFileSync(reviewedFile, JSON.stringify(data, null, 2));
-
-    res.json({
-      ok: true,
-      clearedReviewed: cleared,
-      keptForTrends: kept,
-      flagsCleared: true,
-      cutoffDate: cutoff.toISOString().slice(0, 10)
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// TEMP — remove after use
-// Clears reviewed entries with reviewedAt on/after the given ISO date,
-// so tickets that were incorrectly marked "reviewed" during the model
-// outage (404s) get retried with the working model on the next AI Review run.
-// Older entries are left untouched so trend analysis history isn't lost.
-app.post('/admin/reset-reviewed-since', async (req, res) => {
+// Emergency lever, kept from the original TEMP routes — useful if a future
+// model deprecation or outage causes tickets to be incorrectly marked
+// reviewed again. Gated by requireOwner now that we have real authz instead
+// of being an unauthenticated TEMP route. Older entries are left untouched
+// so trend analysis history isn't lost.
+app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
   try {
     const { since } = req.body;
     if (!since) return res.status(400).json({ error: 'since (ISO date string) required' });
@@ -127,6 +73,8 @@ app.post('/admin/reset-reviewed-since', async (req, res) => {
     data.reviewed = newReviewed;
     fs.writeFileSync(reviewedFile, JSON.stringify(data, null, 2));
 
+    console.warn(`[Admin] ${req.user.name || req.user.oid} reset reviewed entries since ${cutoff.toISOString()}`);
+
     res.json({
       ok: true,
       clearedReviewed: cleared,
@@ -136,6 +84,11 @@ app.post('/admin/reset-reviewed-since', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error('[Error]', err.message);
+  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 app.listen(PORT, () => {

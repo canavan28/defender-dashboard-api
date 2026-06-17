@@ -8,6 +8,13 @@ const ALLOWED_IDS = (process.env.ALLOWED_USER_OBJECT_IDS || '')
   .map(id => id.trim())
   .filter(Boolean);
 
+// Dashboard-access "owner" flag — distinct from the VTO doc's free-text
+// "Rocks owner" field. Controls who can see/edit the VTO tab.
+const OWNER_IDS = (process.env.OWNER_OBJECT_IDS || '')
+  .split(',')
+  .map(id => id.trim())
+  .filter(Boolean);
+
 const client = jwksClient({
   jwksUri: `https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`,
   cache: true,
@@ -31,20 +38,17 @@ function verifyApiKey(req, res, next) {
   }
 
   jwt.verify(token, getKey, {
-  audience: `api://${CLIENT_ID}`,
-  issuer: [
-    `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
-    `https://sts.windows.net/${TENANT_ID}/`
-  ],
-  algorithms: ['RS256']
-}, (err, decoded) => {
-  if (err) {
-    console.error('[Auth] Token verification failed:', err.message);
-    // Decode without verification to see what's inside
-    
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-  
+    audience: `api://${CLIENT_ID}`,
+    issuer: [
+      `https://login.microsoftonline.com/${TENANT_ID}/v2.0`,
+      `https://sts.windows.net/${TENANT_ID}/`
+    ],
+    algorithms: ['RS256']
+  }, (err, decoded) => {
+    if (err) {
+      console.error('[Auth] Token verification failed:', err.message);
+      return res.status(401).json({ error: 'Invalid token' });
+    }
 
     // Check object ID against allowlist
     const oid = decoded.oid || decoded.sub;
@@ -53,9 +57,24 @@ function verifyApiKey(req, res, next) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    req.user = { oid, name: decoded.name, email: decoded.preferred_username };
+    req.user = {
+      oid,
+      name: decoded.name,
+      email: decoded.preferred_username,
+      isOwner: OWNER_IDS.includes(oid)
+    };
     next();
   });
 }
 
-module.exports = { verifyApiKey };
+// Gate for owner-only routes (e.g. VTO). Mount AFTER verifyApiKey so
+// req.user is already populated.
+function requireOwner(req, res, next) {
+  if (!req.user || !req.user.isOwner) {
+    console.warn('[Auth] Non-owner attempted owner-only route:', req.user?.oid);
+    return res.status(403).json({ error: 'Owner access required' });
+  }
+  next();
+}
+
+module.exports = { verifyApiKey, requireOwner };
