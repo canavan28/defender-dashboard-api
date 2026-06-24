@@ -94,3 +94,50 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Defender Dashboard API running on port ${PORT}`);
 });
+
+// TEMP — remove after debugging response times
+app.get('/admin/response-debug/:techId', async (req, res) => {
+  try {
+    const techId = parseInt(req.params.techId);
+    const allTickets = [
+      ...(JSON.parse(require('fs').readFileSync('/app/data/tickets-historical.json', 'utf8')).allTickets || []),
+      ...(JSON.parse(require('fs').readFileSync('/app/data/tickets-recent.json', 'utf8')).allTickets || [])
+    ];
+    const EXCLUDE_COMPANIES = new Set([0, 344]);
+    const EXCLUDE_QUEUES = new Set([29683479, 29683378, 29683480]);
+
+    const results = allTickets
+      .filter(t => t.assignedResourceID === techId
+        && t.createDate
+        && t.firstResponseDateTime
+        && t.priority !== 4
+        && !EXCLUDE_COMPANIES.has(t.companyID)
+        && !EXCLUDE_QUEUES.has(t.queueID))
+      .map(t => {
+        const mins = Math.round((new Date(t.firstResponseDateTime) - new Date(t.createDate)) / (1000 * 60));
+        return {
+          ticket: t.ticketNumber,
+          created: t.createDate,
+          firstResponse: t.firstResponseDateTime,
+          mins,
+          priority: t.priority,
+          companyID: t.companyID,
+          queueID: t.queueID
+        };
+      })
+      .sort((a, b) => b.mins - a.mins);
+
+    const avg = results.length
+      ? Math.round(results.reduce((s, r) => s + r.mins, 0) / results.length)
+      : null;
+
+    res.json({
+      techId,
+      totalTickets: results.length,
+      avgMins: avg,
+      tickets: results.slice(0, 50) // top 50 longest response times
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
