@@ -124,5 +124,24 @@ router.get('/upsells', async (req, res) => {
 
   res.json(results);
 });
+// GET /api/diagnostic/contractserviceunits?contractServiceIds=189,192,379
+router.get('/contractserviceunits', async (req, res) => {
+  const ids = (req.query.contractServiceIds || '').split(',').map(id => parseInt(id.trim(), 10)).filter(Boolean);
+  if (!ids.length) {
+    return res.status(400).json({ error: 'Pass ?contractServiceIds=189,192,379 in the URL' });
+  }
 
+  const results = {};
+  for (const id of ids) {
+    results[id] = await safeStep(`ContractServiceUnits for ContractService ${id}`, async () => {
+      const response = await autotaskClient.post('/ContractServiceUnits/query', {
+        filter: [{ field: 'contractServiceID', op: 'eq', value: id }]
+      });
+      return response.data.items;
+    });
+    await sleep(300);
+  }
+
+  res.json(results);
+});
 module.exports = router;
