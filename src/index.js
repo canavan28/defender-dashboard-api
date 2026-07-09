@@ -4,7 +4,7 @@ const cors = require('cors');
 const ticketsRouter = require('./routes/tickets');
 const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
-const diagnosticRouter = require('./routes/diagnostic');
+const upsellsRouter = require('./routes/upsells');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
 const app = express();
@@ -37,10 +37,7 @@ app.get('/api/me', (req, res) => {
 app.use('/api/tickets', ticketsRouter);
 app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
-
-// TEMPORARY — upsell dashboard AutoTask API discovery. Remove once the real
-// inside-sales/upsell route is built and confirmed working.
-app.use('/api/diagnostic', requireOwner, diagnosticRouter);
+app.use('/api/upsells', upsellsRouter);
 
 // Emergency lever, kept from the original TEMP routes — useful if a future
 // model deprecation or outage causes tickets to be incorrectly marked
