@@ -6,6 +6,7 @@ const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
+const diagnosticRouter = require('./routes/diagnostic');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -38,6 +39,8 @@ app.use('/api/tickets', ticketsRouter);
 app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
+
+app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
 // Emergency lever, kept from the original TEMP routes — useful if a future
 // model deprecation or outage causes tickets to be incorrectly marked
