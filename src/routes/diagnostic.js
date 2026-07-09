@@ -40,7 +40,7 @@ router.get('/upsells', async (req, res) => {
 
   const results = {};
 
-  // 1. Resolve Service IDs by name (needed to match ContractServices.serviceID)
+  // 1. Resolve Service IDs by name (CONFIRMED WORKING)
   results.services = await safeStep('Services lookup', async () => {
     const response = await autotaskClient.post('/Services/query', {
       filter: [
@@ -54,7 +54,7 @@ router.get('/upsells', async (req, res) => {
   });
   await sleep(300);
 
-  // 2. Company record + UDFs (to see the "Services" multiselect raw format)
+  // 2. Company record + UDFs (CONFIRMED WORKING)
   results.company = await safeStep('Company + UDFs', async () => {
     const response = await autotaskClient.post('/Companies/query', {
       filter: [{ field: 'id', op: 'eq', value: companyId }]
@@ -63,7 +63,7 @@ router.get('/upsells', async (req, res) => {
   });
   await sleep(300);
 
-  // 3. Contracts for this company (no status filter yet — want to see real status values first)
+  // 3. Contracts for this company (CONFIRMED WORKING)
   const contractsResult = await safeStep('Contracts for company', async () => {
     const response = await autotaskClient.post('/Contracts/query', {
       filter: [{ field: 'companyID', op: 'eq', value: companyId }]
@@ -73,52 +73,52 @@ router.get('/upsells', async (req, res) => {
   results.contracts = contractsResult;
   await sleep(300);
 
-  // 4. ContractServices — try BOTH a flat query and the nested child path, to see which actually works
-  results.contractServicesAttempts = [];
+  // 4. ContractServices — CONFIRMED: flat query works, nested 404s. Only doing flat now.
+  results.contractServices = [];
   if (contractsResult.ok && contractsResult.data.length) {
     for (const contract of contractsResult.data) {
-      const flatAttempt = await safeStep(`ContractServices FLAT query (contract ${contract.id})`, async () => {
+      const attempt = await safeStep(`ContractServices (contract ${contract.id})`, async () => {
         const response = await autotaskClient.post('/ContractServices/query', {
           filter: [{ field: 'contractID', op: 'eq', value: contract.id }]
         });
         return response.data.items;
       });
+      results.contractServices.push({ contractId: contract.id, attempt });
       await sleep(300);
-
-      const nestedAttempt = await safeStep(`ContractServices NESTED query (contract ${contract.id})`, async () => {
-        const response = await autotaskClient.post(`/Contracts/${contract.id}/ContractServices/query`, {
-          filter: [{ field: 'id', op: 'gte', value: 0 }]
-        });
-        return response.data.items;
-      });
-      await sleep(300);
-
-      results.contractServicesAttempts.push({ contractId: contract.id, flatAttempt, nestedAttempt });
     }
   }
 
-  // 5. Opportunities for this company (Quotes must attach to one)
-  const opportunitiesResult = await safeStep('Opportunities for company', async () => {
-    const response = await autotaskClient.post('/Opportunities/query', {
+  // 5. Quotes — NEW APPROACH: flat query filtered directly by companyID (no Opportunity nesting needed)
+  const quotesResult = await safeStep('Quotes FLAT query by companyID', async () => {
+    const response = await autotaskClient.post('/Quotes/query', {
       filter: [{ field: 'companyID', op: 'eq', value: companyId }]
     });
     return response.data.items;
   });
-  results.opportunities = opportunitiesResult;
+  results.quotes = quotesResult;
   await sleep(300);
 
-  // 6. Quotes — nested under each Opportunity
-  results.quoteAttempts = [];
-  if (opportunitiesResult.ok && opportunitiesResult.data.length) {
-    for (const opp of opportunitiesResult.data) {
-      const quotesAttempt = await safeStep(`Quotes NESTED query (opportunity ${opp.id})`, async () => {
-        const response = await autotaskClient.post(`/Opportunities/${opp.id}/Quotes/query`, {
+  // 6. QuoteItems — try BOTH flat and nested, same approach that resolved ContractServices
+  results.quoteItemsAttempts = [];
+  if (quotesResult.ok && quotesResult.data.length) {
+    for (const quote of quotesResult.data) {
+      const flatAttempt = await safeStep(`QuoteItems FLAT query (quote ${quote.id})`, async () => {
+        const response = await autotaskClient.post('/QuoteItems/query', {
+          filter: [{ field: 'quoteID', op: 'eq', value: quote.id }]
+        });
+        return response.data.items;
+      });
+      await sleep(300);
+
+      const nestedAttempt = await safeStep(`QuoteItems NESTED query (quote ${quote.id})`, async () => {
+        const response = await autotaskClient.post(`/Quotes/${quote.id}/QuoteItems/query`, {
           filter: [{ field: 'id', op: 'gte', value: 0 }]
         });
         return response.data.items;
       });
-      results.quoteAttempts.push({ opportunityId: opp.id, quotesAttempt });
       await sleep(300);
+
+      results.quoteItemsAttempts.push({ quoteId: quote.id, flatAttempt, nestedAttempt });
     }
   }
 
