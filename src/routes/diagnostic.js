@@ -144,4 +144,76 @@ router.get('/contractserviceunits', async (req, res) => {
 
   res.json(results);
 });
+
+const BUNDLE_NAMES = [
+  'InfoTank Professional + Plan',
+  'InfoTank Professional Plan Services',
+  'InfoTank Essentials Plan Services',
+  'Software Essentials'
+];
+
+// GET /api/diagnostic/bundles?companyId=563
+router.get('/bundles', async (req, res) => {
+  const companyId = parseInt(req.query.companyId, 10);
+  const results = {};
+
+  // 1. Resolve bundle IDs by name
+  const bundlesResult = await safeStep('ServiceBundles lookup', async () => {
+    const response = await autotaskClient.post('/ServiceBundles/query', {
+      filter: [
+        {
+          op: 'or',
+          items: BUNDLE_NAMES.map(name => ({ field: 'name', op: 'eq', value: name }))
+        }
+      ]
+    });
+    return response.data.items;
+  });
+  results.bundles = bundlesResult;
+  await sleep(300);
+
+  // 2. For each bundle found, see what services it includes
+  results.bundleServices = [];
+  if (bundlesResult.ok && bundlesResult.data.length) {
+    for (const bundle of bundlesResult.data) {
+      const attempt = await safeStep(`ServiceBundleServices for bundle "${bundle.name}" (${bundle.id})`, async () => {
+        const response = await autotaskClient.post('/ServiceBundleServices/query', {
+          filter: [{ field: 'serviceBundleID', op: 'eq', value: bundle.id }]
+        });
+        return response.data.items;
+      });
+      results.bundleServices.push({ bundleId: bundle.id, bundleName: bundle.name, attempt });
+      await sleep(300);
+    }
+  }
+
+  // 3. If a companyId was passed, check which bundle (if any) that company's contract is on
+  if (companyId) {
+    const contractsResult = await safeStep('Contracts for company', async () => {
+      const response = await autotaskClient.post('/Contracts/query', {
+        filter: [{ field: 'companyID', op: 'eq', value: companyId }]
+      });
+      return response.data.items;
+    });
+    results.contracts = contractsResult;
+    await sleep(300);
+
+    results.contractServiceBundles = [];
+    if (contractsResult.ok && contractsResult.data.length) {
+      for (const contract of contractsResult.data) {
+        const attempt = await safeStep(`ContractServiceBundles for contract ${contract.id}`, async () => {
+          const response = await autotaskClient.post('/ContractServiceBundles/query', {
+            filter: [{ field: 'contractID', op: 'eq', value: contract.id }]
+          });
+          return response.data.items;
+        });
+        results.contractServiceBundles.push({ contractId: contract.id, attempt });
+        await sleep(300);
+      }
+    }
+  }
+
+  res.json(results);
+});
+
 module.exports = router;
