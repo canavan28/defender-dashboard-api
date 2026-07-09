@@ -53,6 +53,12 @@ const TRACKED_UPSELLS = [
   { key: 'vPenTest', label: 'vPenTest', serviceID: 83 }
 ];
 
+// TODO: fill in once we confirm the classification picklist values via the
+// diagnostic route. Numeric IDs for Professional Plus / Professional /
+// Essentials / Software Essentials go here. Left empty (no filtering) until
+// confirmed, so we don't accidentally exclude real MSP clients on a guess.
+const MANAGED_SERVICE_CLASSIFICATIONS = [];
+
 // ── Generic paginated flat query helper ──────────────────────────────────
 async function queryAllFlat(entityPath, filter) {
   let allItems = [];
@@ -71,9 +77,6 @@ async function queryAllFlat(entityPath, filter) {
 }
 
 // ── Build a map of every ServiceBundle -> which service IDs it includes ──
-// This is deliberately NOT hardcoded to the named tiers - it picks up any
-// combo bundle (like the "Vigilance + vPenTest" bundle we found on COE)
-// automatically, since we check every active bundle's actual contents.
 async function buildServiceBundleMap() {
   const bundles = await queryAllFlat('/ServiceBundles/query', [
     { field: 'isActive', op: 'eq', value: true }
@@ -93,18 +96,23 @@ async function buildServiceBundleMap() {
   return map;
 }
 
-// ── Fetch active customer companies ──────────────────────────────────────
+// ── Fetch active companies (managed-service classification filter applied
+// once MANAGED_SERVICE_CLASSIFICATIONS is populated - currently a no-op) ──
 async function fetchActiveCompanies() {
-  return queryAllFlat('/Companies/query', [
+  const filter = [
     { field: 'isActive', op: 'eq', value: true },
     { field: 'companyType', op: 'eq', value: 1 }
-  ]);
+  ];
+  if (MANAGED_SERVICE_CLASSIFICATIONS.length) {
+    filter.push({
+      op: 'or',
+      items: MANAGED_SERVICE_CLASSIFICATIONS.map(c => ({ field: 'classification', op: 'eq', value: c }))
+    });
+  }
+  return queryAllFlat('/Companies/query', filter);
 }
 
 // ── Determine if a ContractService's billing is currently active ────────
-// Returns { active: bool, mrr: number } based on the most relevant
-// ContractServiceUnits period (catches the "cancelled but line item still
-// on contract" case we found with COE's Backup-NAS).
 async function resolveBillingStatus(contractServiceId) {
   const units = await queryAllFlat('/ContractServiceUnits/query', [
     { field: 'contractServiceID', op: 'eq', value: contractServiceId }
@@ -121,112 +129,134 @@ async function resolveBillingStatus(contractServiceId) {
   return { active: false, mrr: 0 };
 }
 
-// ── Process a single company against all tracked upsells ────────────────
-async function processCompany(company, bundleMap) {
+// ── Process a single company - every sub-step is individually guarded so a
+// failure on one contract/quote/bundle only loses that piece of data, not
+// the whole company from the dashboard. ──────────────────────────────────
+async function processCompany(company, bundleMap, errors) {
   const result = {
     companyId: company.id,
     companyName: company.companyName,
+    classification: company.classification,
     upsells: {}
   };
   TRACKED_UPSELLS.forEach(u => {
     result.upsells[u.key] = { status: 'not_quoted', label: u.label };
   });
 
-  // UDF cross-check values (secondary signal only - see notes below)
   const servicesUdf = (company.userDefinedFields || []).find(f => f.name === 'Services');
   const udfValues = servicesUdf?.value
     ? servicesUdf.value.split(',').map(v => v.trim())
     : [];
 
-  // Contracts -> only Recurring Service type (contractType 7) matter here
-  const contracts = await queryAllFlat('/Contracts/query', [
-    { field: 'companyID', op: 'eq', value: company.id }
-  ]);
-  await sleep(200);
-  const recurringContracts = contracts.filter(c => c.contractType === 7);
-
-  for (const contract of recurringContracts) {
-    // Individually billed ContractServices
-    const services = await queryAllFlat('/ContractServices/query', [
-      { field: 'contractID', op: 'eq', value: contract.id }
-    ]);
-    await sleep(200);
-
-    for (const upsell of TRACKED_UPSELLS) {
-      const match = services.find(s => s.serviceID === upsell.serviceID);
-      if (match) {
-        const billing = await resolveBillingStatus(match.id);
-        await sleep(150);
-        result.upsells[upsell.key] = billing.active
-          ? { status: 'active', label: upsell.label, mrr: billing.mrr, contractServiceId: match.id }
-          : { status: 'lapsed', label: upsell.label, contractServiceId: match.id };
-      }
-    }
-
-    // Bundled inclusions (base tiers + combo bundles like Vigilance+vPenTest)
-    const contractBundles = await queryAllFlat('/ContractServiceBundles/query', [
-      { field: 'contractID', op: 'eq', value: contract.id }
-    ]);
-    await sleep(200);
-
-    for (const cb of contractBundles) {
-      const bundleInfo = bundleMap[cb.serviceBundleID];
-      if (!bundleInfo) continue;
-      for (const upsell of TRACKED_UPSELLS) {
-        if (bundleInfo.serviceIds.has(upsell.serviceID) && result.upsells[upsell.key].status !== 'active') {
-          result.upsells[upsell.key] = {
-            status: 'included',
-            label: upsell.label,
-            bundleName: bundleInfo.name
-          };
-        }
-      }
-    }
-  }
-
-  // Quotes - only matters for upsells not already resolved via contract/bundle
-  const stillUnresolved = TRACKED_UPSELLS.some(u => result.upsells[u.key].status === 'not_quoted');
-  if (stillUnresolved) {
-    const quotes = await queryAllFlat('/Quotes/query', [
+  let contracts = [];
+  try {
+    contracts = await queryAllFlat('/Contracts/query', [
       { field: 'companyID', op: 'eq', value: company.id }
     ]);
     await sleep(200);
+  } catch (err) {
+    errors.push({ companyId: company.id, companyName: company.companyName, step: 'contracts', message: err.message });
+    contracts = [];
+  }
 
-    const bestQuoteByUpsell = {};
-    for (const quote of quotes) {
-      const items = await queryAllFlat('/QuoteItems/query', [
-        { field: 'quoteID', op: 'eq', value: quote.id }
+  const recurringContracts = contracts.filter(c => c.contractType === 7);
+
+  for (const contract of recurringContracts) {
+    try {
+      const services = await queryAllFlat('/ContractServices/query', [
+        { field: 'contractID', op: 'eq', value: contract.id }
       ]);
-      await sleep(150);
+      await sleep(200);
 
       for (const upsell of TRACKED_UPSELLS) {
-        if (result.upsells[upsell.key].status !== 'not_quoted') continue;
-        const match = items.find(i => i.serviceID === upsell.serviceID);
+        const match = services.find(s => s.serviceID === upsell.serviceID);
         if (match) {
-          const existing = bestQuoteByUpsell[upsell.key];
-          if (!existing || new Date(quote.createDate) > new Date(existing.createDate)) {
-            bestQuoteByUpsell[upsell.key] = quote;
+          try {
+            const billing = await resolveBillingStatus(match.id);
+            await sleep(150);
+            result.upsells[upsell.key] = billing.active
+              ? { status: 'active', label: upsell.label, mrr: billing.mrr, contractServiceId: match.id }
+              : { status: 'lapsed', label: upsell.label, contractServiceId: match.id };
+          } catch (err) {
+            errors.push({ companyId: company.id, companyName: company.companyName, step: `billingStatus:${match.id}`, message: err.message });
           }
         }
       }
+    } catch (err) {
+      errors.push({ companyId: company.id, companyName: company.companyName, step: `contractServices:${contract.id}`, message: err.message });
     }
 
-    for (const upsell of TRACKED_UPSELLS) {
-      const quote = bestQuoteByUpsell[upsell.key];
-      if (!quote) continue;
-      if (quote.extApprovalContactResponse === 1) {
-        result.upsells[upsell.key] = { status: 'sold_not_on_contract', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
-      } else if (quote.extApprovalContactResponse === 2) {
-        result.upsells[upsell.key] = { status: 'declined', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
-      } else {
-        result.upsells[upsell.key] = { status: 'awaiting', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
+    try {
+      const contractBundles = await queryAllFlat('/ContractServiceBundles/query', [
+        { field: 'contractID', op: 'eq', value: contract.id }
+      ]);
+      await sleep(200);
+
+      for (const cb of contractBundles) {
+        const bundleInfo = bundleMap[cb.serviceBundleID];
+        if (!bundleInfo) continue;
+        for (const upsell of TRACKED_UPSELLS) {
+          if (bundleInfo.serviceIds.has(upsell.serviceID) && result.upsells[upsell.key].status !== 'active') {
+            result.upsells[upsell.key] = {
+              status: 'included',
+              label: upsell.label,
+              bundleName: bundleInfo.name
+            };
+          }
+        }
       }
+    } catch (err) {
+      errors.push({ companyId: company.id, companyName: company.companyName, step: `contractServiceBundles:${contract.id}`, message: err.message });
     }
   }
 
-  // UDF flag - secondary signal for manual review. Only meaningful when the
-  // UDF says "yes" but nothing else (contract/bundle) explains it - those
-  // are the cases Matt wants to personally sort into real gaps vs freebies.
+  const stillUnresolved = TRACKED_UPSELLS.some(u => result.upsells[u.key].status === 'not_quoted');
+  if (stillUnresolved) {
+    try {
+      const quotes = await queryAllFlat('/Quotes/query', [
+        { field: 'companyID', op: 'eq', value: company.id }
+      ]);
+      await sleep(200);
+
+      const bestQuoteByUpsell = {};
+      for (const quote of quotes) {
+        try {
+          const items = await queryAllFlat('/QuoteItems/query', [
+            { field: 'quoteID', op: 'eq', value: quote.id }
+          ]);
+          await sleep(150);
+
+          for (const upsell of TRACKED_UPSELLS) {
+            if (result.upsells[upsell.key].status !== 'not_quoted') continue;
+            const match = items.find(i => i.serviceID === upsell.serviceID);
+            if (match) {
+              const existing = bestQuoteByUpsell[upsell.key];
+              if (!existing || new Date(quote.createDate) > new Date(existing.createDate)) {
+                bestQuoteByUpsell[upsell.key] = quote;
+              }
+            }
+          }
+        } catch (err) {
+          errors.push({ companyId: company.id, companyName: company.companyName, step: `quoteItems:${quote.id}`, message: err.message });
+        }
+      }
+
+      for (const upsell of TRACKED_UPSELLS) {
+        const quote = bestQuoteByUpsell[upsell.key];
+        if (!quote) continue;
+        if (quote.extApprovalContactResponse === 1) {
+          result.upsells[upsell.key] = { status: 'sold_not_on_contract', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
+        } else if (quote.extApprovalContactResponse === 2) {
+          result.upsells[upsell.key] = { status: 'declined', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
+        } else {
+          result.upsells[upsell.key] = { status: 'awaiting', label: upsell.label, quoteId: quote.id, quoteName: quote.name };
+        }
+      }
+    } catch (err) {
+      errors.push({ companyId: company.id, companyName: company.companyName, step: 'quotes', message: err.message });
+    }
+  }
+
   for (const upsell of TRACKED_UPSELLS) {
     const udfSaysYes = udfValues.includes(upsell.label);
     if (udfSaysYes && !['active', 'included'].includes(result.upsells[upsell.key].status)) {
@@ -240,6 +270,7 @@ async function processCompany(company, bundleMap) {
 // ── Full cache rebuild ────────────────────────────────────────────────────
 async function buildCache() {
   console.log('[UpsellsCache] Starting full rebuild...');
+  const errors = [];
   const bundleMap = await buildServiceBundleMap();
   await sleep(300);
 
@@ -248,16 +279,16 @@ async function buildCache() {
 
   const results = [];
   for (const company of companies) {
-    try {
-      const companyResult = await processCompany(company, bundleMap);
-      results.push(companyResult);
-    } catch (err) {
-      console.error(`[UpsellsCache] Failed on company ${company.id} (${company.companyName}):`, err.message);
-    }
+    const companyResult = await processCompany(company, bundleMap, errors);
+    results.push(companyResult); // always pushed, even if some sub-steps failed
     await sleep(300);
   }
 
-  const newCache = { companies: results, builtAt: new Date().toISOString() };
+  if (errors.length) {
+    console.warn(`[UpsellsCache] Completed with ${errors.length} partial errors:`, JSON.stringify(errors));
+  }
+
+  const newCache = { companies: results, builtAt: new Date().toISOString(), processingErrors: errors };
   saveCacheToDisk(newCache);
   return newCache;
 }
@@ -277,7 +308,7 @@ router.get('/all', async (req, res, next) => {
 router.get('/refresh', async (req, res, next) => {
   try {
     cache = await buildCache();
-    res.json({ ok: true, totalCompanies: cache.companies.length, builtAt: cache.builtAt });
+    res.json({ ok: true, totalCompanies: cache.companies.length, builtAt: cache.builtAt, processingErrors: cache.processingErrors });
   } catch (err) {
     next(err);
   }

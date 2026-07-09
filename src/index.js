@@ -5,8 +5,8 @@ const ticketsRouter = require('./routes/tickets');
 const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
-const { verifyApiKey, requireOwner } = require('./middleware/auth');
 const diagnosticRouter = require('./routes/diagnostic');
+const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -39,14 +39,8 @@ app.use('/api/tickets', ticketsRouter);
 app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
-
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
-// Emergency lever, kept from the original TEMP routes — useful if a future
-// model deprecation or outage causes tickets to be incorrectly marked
-// reviewed again. Gated by requireOwner now that we have real authz instead
-// of being an unauthenticated TEMP route. Older entries are left untouched
-// so trend analysis history isn't lost.
 app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
   try {
     const { since } = req.body;
@@ -100,7 +94,6 @@ app.listen(PORT, () => {
   console.log(`Defender Dashboard API running on port ${PORT}`);
 });
 
-// TEMP — remove after debugging response times
 app.get('/admin/response-debug/:techId', async (req, res) => {
   try {
     const techId = parseInt(req.params.techId);
@@ -140,7 +133,7 @@ app.get('/admin/response-debug/:techId', async (req, res) => {
       techId,
       totalTickets: results.length,
       avgMins: avg,
-      tickets: results.slice(0, 50) // top 50 longest response times
+      tickets: results.slice(0, 50)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
