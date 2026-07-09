@@ -53,11 +53,12 @@ const TRACKED_UPSELLS = [
   { key: 'vPenTest', label: 'vPenTest', serviceID: 83 }
 ];
 
-// TODO: fill in once we confirm the classification picklist values via the
-// diagnostic route. Numeric IDs for Professional Plus / Professional /
-// Essentials / Software Essentials go here. Left empty (no filtering) until
-// confirmed, so we don't accidentally exclude real MSP clients on a guess.
-const MANAGED_SERVICE_CLASSIFICATIONS = [];
+// Company.classification picklist values, confirmed against the real
+// AutoTask picklist definition:
+//   15 = Professional + Plan
+//   17 = Professional Plan
+//   16 = Essentials Plan  (also covers "Software Essentials" clients, e.g. company 334)
+const MANAGED_SERVICE_CLASSIFICATIONS = [15, 17, 16];
 
 // ── Generic paginated flat query helper ──────────────────────────────────
 async function queryAllFlat(entityPath, filter) {
@@ -96,19 +97,16 @@ async function buildServiceBundleMap() {
   return map;
 }
 
-// ── Fetch active companies (managed-service classification filter applied
-// once MANAGED_SERVICE_CLASSIFICATIONS is populated - currently a no-op) ──
+// ── Fetch active managed-service companies only ──────────────────────────
 async function fetchActiveCompanies() {
   const filter = [
     { field: 'isActive', op: 'eq', value: true },
-    { field: 'companyType', op: 'eq', value: 1 }
-  ];
-  if (MANAGED_SERVICE_CLASSIFICATIONS.length) {
-    filter.push({
+    { field: 'companyType', op: 'eq', value: 1 },
+    {
       op: 'or',
       items: MANAGED_SERVICE_CLASSIFICATIONS.map(c => ({ field: 'classification', op: 'eq', value: c }))
-    });
-  }
+    }
+  ];
   return queryAllFlat('/Companies/query', filter);
 }
 
@@ -275,12 +273,12 @@ async function buildCache() {
   await sleep(300);
 
   const companies = await fetchActiveCompanies();
-  console.log(`[UpsellsCache] Processing ${companies.length} companies...`);
+  console.log(`[UpsellsCache] Processing ${companies.length} managed-service companies...`);
 
   const results = [];
   for (const company of companies) {
     const companyResult = await processCompany(company, bundleMap, errors);
-    results.push(companyResult); // always pushed, even if some sub-steps failed
+    results.push(companyResult);
     await sleep(300);
   }
 
