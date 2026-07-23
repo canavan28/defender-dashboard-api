@@ -5,6 +5,7 @@ const ticketsRouter = require('./routes/tickets');
 const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
+const salesMetricsRouter = require('./routes/salesMetrics');
 const diagnosticRouter = require('./routes/diagnostic');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
@@ -39,6 +40,7 @@ app.use('/api/tickets', ticketsRouter);
 app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
+app.use('/api/sales', salesMetricsRouter);
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
 app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
