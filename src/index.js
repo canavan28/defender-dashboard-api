@@ -6,6 +6,7 @@ const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
 const salesMetricsRouter = require('./routes/salesMetrics');
+const customerSuccessRouter = require('./routes/customerSuccess');
 const diagnosticRouter = require('./routes/diagnostic');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
@@ -41,6 +42,7 @@ app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
 app.use('/api/sales', salesMetricsRouter);
+app.use('/api/customer-success', customerSuccessRouter);
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
 app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
@@ -87,16 +89,10 @@ app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
   }
 });
 
-app.use((err, req, res, next) => {
-  console.error('[Error]', err.message);
-  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
-});
-
-app.listen(PORT, () => {
-  console.log(`Defender Dashboard API running on port ${PORT}`);
-});
-
-app.get('/admin/response-debug/:techId', async (req, res) => {
+// Moved under /api (so the global verifyApiKey gate applies) and now
+// requireOwner-gated, since this exposes raw per-tech ticket data and isn't
+// something the other three execs need — same treatment as /api/diagnostic.
+app.get('/api/admin/response-debug/:techId', requireOwner, async (req, res) => {
   try {
     const techId = parseInt(req.params.techId);
     const allTickets = [
@@ -140,4 +136,13 @@ app.get('/admin/response-debug/:techId', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+app.use((err, req, res, next) => {
+  console.error('[Error]', err.message);
+  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Defender Dashboard API running on port ${PORT}`);
 });
