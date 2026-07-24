@@ -39,9 +39,21 @@ let cache = null;
 function loadData() {
   if (cache) return cache;
   try {
-    cache = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    // Migrate away from the old single shared `lastSync` checkpoint (bug:
+    // it advanced even when a step failed, so a failed step would silently
+    // skip its missed window on the next run instead of retrying it).
+    // Deliberately NOT carrying the old value forward — dropping it forces
+    // one full trailing-12-month re-pull to backfill whatever was missed,
+    // then per-step checkpoints take over cleanly from there.
+    if ('lastSync' in parsed) {
+      delete parsed.lastSync;
+    }
+    parsed.lastSyncSlaBreaches = parsed.lastSyncSlaBreaches || null;
+    parsed.lastSyncSurveys = parsed.lastSyncSurveys || null;
+    cache = parsed;
   } catch (err) {
-    cache = { clients: {}, lastSync: null };
+    cache = { clients: {}, lastSyncSlaBreaches: null, lastSyncSurveys: null };
   }
   return cache;
 }
@@ -202,14 +214,18 @@ router.delete('/scores/:companyId/events/:eventId', (req, res) => {
 });
 
 // POST /api/customer-success/sync — pulls SLA breaches + AutoTask survey
-// results since the last sync, appends system-generated events.
+// results since each step's own last-successful-run checkpoint, appends
+// system-generated events.
 router.post('/sync', async (req, res) => {
   const data = loadData();
   const errors = [];
-  // First-ever sync (no data.lastSync yet) defaults to trailing 12 months,
+  const overrideSince = req.body?.since; // manual override, if provided, applies to both steps
+
+  // First-ever sync (no checkpoint yet) defaults to trailing 12 months,
   // matching the Finance pillar's confirmed reporting window — not all-time,
   // to avoid pulling years of tickets/surveys in one shot.
-  const since = req.body?.since || data.lastSync || trailing12MonthsISO();
+  const slaSince = overrideSince || data.lastSyncSlaBreaches || trailing12MonthsISO();
+  const surveySince = overrideSince || data.lastSyncSurveys || trailing12MonthsISO();
 
   // --- SLA breaches ---
   // Matches useTicketMetrics.js exactly: eligible = has firstResponseDueDateTime;
@@ -223,10 +239,11 @@ router.post('/sync', async (req, res) => {
   // "since" whose due date only lapses after "since" could be missed on a
   // given incremental run — low-risk in practice since due dates are usually
   // set within the same day as creation, but flagging the tradeoff.
+  let slaBreachesOk = false;
   try {
     const tickets = await queryAll('Tickets', {
       filter: [
-        { field: 'createDate', op: 'gte', value: since },
+        { field: 'createDate', op: 'gte', value: slaSince },
         { field: 'firstResponseDueDateTime', op: 'exist' },
       ],
     });
@@ -248,14 +265,16 @@ router.post('/sync', async (req, res) => {
         enteredBy: null,
       });
     }
+    slaBreachesOk = true;
   } catch (err) {
-    errors.push({ step: 'sla_breaches', ...describeAutotaskError(err) });
+    errors.push({ step: 'sla_breaches', since: slaSince, ...describeAutotaskError(err) });
   }
 
   // --- AutoTask survey results ---
+  let surveysOk = false;
   try {
     const surveyResults = await queryAll('SurveyResults', {
-      filter: [{ field: 'completeDate', op: 'gte', value: since }],
+      filter: [{ field: 'completeDate', op: 'gte', value: surveySince }],
     });
     for (const result of surveyResults) {
       if (result.surveyRating == null || !result.companyID) continue;
@@ -270,11 +289,19 @@ router.post('/sync', async (req, res) => {
         enteredBy: null,
       });
     }
+    surveysOk = true;
   } catch (err) {
-    errors.push({ step: 'autotask_survey', ...describeAutotaskError(err) });
+    errors.push({ step: 'autotask_survey', since: surveySince, ...describeAutotaskError(err) });
   }
 
-  data.lastSync = new Date().toISOString();
+  // Only advance a step's checkpoint if it actually succeeded — a failed
+  // step must retry its full original window next time, not silently skip
+  // ahead to "now". This is the exact bug that caused the first successful
+  // sync to only look back a couple minutes instead of the full 12 months.
+  const now = new Date().toISOString();
+  if (slaBreachesOk) data.lastSyncSlaBreaches = now;
+  if (surveysOk) data.lastSyncSurveys = now;
+
   saveData(data);
   res.json({ ok: true, errors });
 });
