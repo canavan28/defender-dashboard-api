@@ -169,6 +169,27 @@ async function fetchCompanyInfo() {
   return { nameMap, excludedIds };
 }
 
+// SurveyResults only gives a ticketID foreign key, not the human-readable
+// ticketNumber techs/AMs actually recognize — this resolves that in
+// batches (AutoTask's 'in' filter operator, confirmed supported) rather
+// than one query per survey result.
+async function fetchTicketNumberMap(ticketIds) {
+  const unique = [...new Set(ticketIds.filter(Boolean))];
+  const map = {};
+  const CHUNK = 200;
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK);
+    const tickets = await queryAll('Tickets', {
+      filter: [{ field: 'id', op: 'in', value: chunk }],
+    });
+    for (const t of tickets) {
+      map[t.id] = t.ticketNumber;
+    }
+    if (i + CHUNK < unique.length) await sleep(PAGE_SLEEP_MS);
+  }
+  return map;
+}
+
 function trailing12MonthsISO() {
   const d = new Date();
   d.setFullYear(d.getFullYear() - 1);
@@ -330,7 +351,7 @@ router.post('/sync', async (req, res) => {
         type: 'sla_breach',
         delta: -1,
         date: ticket.createDate,
-        source: { ticketId: ticket.id },
+        source: { ticketId: ticket.id, ticketNumber: ticket.ticketNumber },
         enteredBy: null,
       });
     }
@@ -345,6 +366,17 @@ router.post('/sync', async (req, res) => {
     const surveyResults = await queryAll('SurveyResults', {
       filter: [{ field: 'completeDate', op: 'gte', value: surveySince }],
     });
+
+    // Best-effort ticket number resolution — a failure here shouldn't
+    // block survey scoring, it just means those entries show no ticket
+    // number this run (falls back to null, same as before this existed).
+    let ticketNumberMap = {};
+    try {
+      ticketNumberMap = await fetchTicketNumberMap(surveyResults.map(r => r.ticketID));
+    } catch (err) {
+      errors.push({ step: 'survey_ticket_numbers', ...describeAutotaskError(err) });
+    }
+
     for (const result of surveyResults) {
       if (result.surveyRating == null || !result.companyID || excludedCompanyIds.has(result.companyID)) continue;
       const client = ensureClient(data, result.companyID, companyNameMap[String(result.companyID)]);
@@ -354,7 +386,12 @@ router.post('/sync', async (req, res) => {
         type: 'autotask_review',
         delta: surveyRatingToPoints(result.surveyRating),
         date: result.completeDate,
-        source: { ticketId: result.ticketID, surveyResultId: result.id, rating: result.surveyRating },
+        source: {
+          ticketId: result.ticketID,
+          ticketNumber: ticketNumberMap[result.ticketID] || null,
+          surveyResultId: result.id,
+          rating: result.surveyRating,
+        },
         enteredBy: null,
       });
     }
