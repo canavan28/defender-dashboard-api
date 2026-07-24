@@ -108,11 +108,13 @@ function surveyRatingToPoints(rating) {
 
 // Follows AutoTask's pageDetails.nextPageUrl pagination, paced with a
 // short sleep between pages to stay under rate limits. CONFIRMED against
-// this instance (zone webservices14): despite AutoTask's general docs
-// saying GET works for nextPageUrl continuation, this zone returns
-// 405 "does not support http method 'GET'" — POST is required instead.
-// The paging state is already encoded in the URL's querystring, so an
-// empty body is sufficient.
+// this instance (zone webservices14):
+//   1. GET on nextPageUrl -> 405 (general AT docs say GET works; this zone
+//      disagrees and requires POST).
+//   2. POST with an empty body -> 500 "Value cannot be null. Parameter
+//      name: filters" — so the original filter body must be resent on
+//      every page, even though the paging cursor itself is already
+//      encoded in the URL's querystring.
 async function queryAll(entity, body) {
   let items = [];
   const first = await autotaskClient.post(`/${entity}/query`, body);
@@ -120,7 +122,7 @@ async function queryAll(entity, body) {
   let nextUrl = first.data.pageDetails?.nextPageUrl;
   while (nextUrl) {
     await sleep(PAGE_SLEEP_MS);
-    const pageRes = await axios.post(nextUrl, {}, { headers: getHeaders() });
+    const pageRes = await axios.post(nextUrl, body, { headers: getHeaders() });
     items = items.concat(pageRes.data.items || []);
     nextUrl = pageRes.data.pageDetails?.nextPageUrl;
   }
