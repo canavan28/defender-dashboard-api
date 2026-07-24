@@ -117,7 +117,20 @@ function trailing12MonthsISO() {
   return d.toISOString();
 }
 
-// ---- Routes ----
+// Extracts full diagnostic detail from an AutoTask API error. The debug
+// interceptor in autotask.js only logs response bodies for 429/500 — this
+// makes sure errors of ANY status (like the 405 we hit on first sync) show
+// up with enough detail to actually diagnose, instead of axios's generic
+// "Request failed with status code X".
+function describeAutotaskError(err) {
+  return {
+    message: err.message,
+    status: err.response?.status,
+    url: err.config?.url,
+    method: err.config?.method,
+    data: err.response?.data,
+  };
+}
 
 // GET /api/customer-success/scores — summary list, all clients
 router.get('/scores', (req, res) => {
@@ -236,7 +249,7 @@ router.post('/sync', async (req, res) => {
       });
     }
   } catch (err) {
-    errors.push({ step: 'sla_breaches', message: err.message });
+    errors.push({ step: 'sla_breaches', ...describeAutotaskError(err) });
   }
 
   // --- AutoTask survey results ---
@@ -258,7 +271,7 @@ router.post('/sync', async (req, res) => {
       });
     }
   } catch (err) {
-    errors.push({ step: 'autotask_survey', message: err.message });
+    errors.push({ step: 'autotask_survey', ...describeAutotaskError(err) });
   }
 
   data.lastSync = new Date().toISOString();
