@@ -129,6 +129,46 @@ async function queryAll(entity, body) {
   return items;
 }
 
+// Companies excluded entirely from Customer Success scoring — not real
+// external clients tracked the normal way. Mirrors EXCLUDE_RESPONSE_COMPANIES
+// in useTicketMetrics.js, which excludes the same two IDs for the same
+// underlying reason:
+//   0   = InfoTank internal
+//   344 = NJC
+const EXCLUDE_CS_COMPANIES = new Set([0, 344]);
+
+// "Web Dev Customer" classification value, confirmed via an earlier
+// classification-picklist pull against this AutoTask instance (not listed
+// anywhere in the admin UI directly — this is the numeric picklist value
+// AutoTask stores on Company.classification).
+const WEB_DEV_CLASSIFICATION = 19;
+
+// Resolves companyID -> companyName directly from AutoTask's own Companies
+// entity, rather than relying on the dashboard's ticket-derived companyMap
+// (which doesn't necessarily cover every company these queries touch —
+// hence some clients showing as "Company #351" etc.). Also determines the
+// full exclusion set for this run: the fixed IDs above, plus any company
+// currently classified as Web Dev Customer (classification 19), since that
+// classification can change/be reassigned over time and isn't safe to
+// hardcode as a static ID list the way NJC/internal are.
+// Best-effort: if this fails, sync continues without names or dynamic
+// exclusion (falling back to just the fixed IDs) rather than blocking.
+async function fetchCompanyInfo() {
+  const companies = await queryAll('Companies', {
+    filter: [{ field: 'id', op: 'gte', value: 0 }],
+  });
+  const nameMap = {};
+  const excludedIds = new Set(EXCLUDE_CS_COMPANIES);
+  for (const c of companies) {
+    if (c.id == null) continue;
+    nameMap[String(c.id)] = c.companyName;
+    if (Number(c.classification) === WEB_DEV_CLASSIFICATION) {
+      excludedIds.add(c.id);
+    }
+  }
+  return { nameMap, excludedIds };
+}
+
 function trailing12MonthsISO() {
   const d = new Date();
   d.setFullYear(d.getFullYear() - 1);
@@ -227,6 +267,29 @@ router.post('/sync', async (req, res) => {
   const errors = [];
   const overrideSince = req.body?.since; // manual override, if provided, applies to both steps
 
+  // Best-effort company info resolution (names + dynamic Web Dev exclusion).
+  // Doesn't block the rest of sync if it fails — falls back to just the
+  // fixed NJC/internal exclusions and no display names for this run.
+  let companyNameMap = {};
+  let excludedCompanyIds = new Set(EXCLUDE_CS_COMPANIES);
+  try {
+    const info = await fetchCompanyInfo();
+    companyNameMap = info.nameMap;
+    excludedCompanyIds = info.excludedIds;
+  } catch (err) {
+    errors.push({ step: 'company_info', ...describeAutotaskError(err) });
+  }
+
+  // Self-heal: remove any client records for excluded companies that were
+  // captured before their exclusion existed (e.g. NJC breaches pulled during
+  // the first full-history sync, or Web Dev clients pulled before this
+  // classification-based exclusion was added).
+  for (const key of Object.keys(data.clients)) {
+    if (excludedCompanyIds.has(Number(key))) {
+      delete data.clients[key];
+    }
+  }
+
   // First-ever sync (no checkpoint yet) defaults to trailing 12 months,
   // matching the Finance pillar's confirmed reporting window — not all-time,
   // to avoid pulling years of tickets/surveys in one shot.
@@ -254,13 +317,13 @@ router.post('/sync', async (req, res) => {
       ],
     });
     for (const ticket of tickets) {
-      if (!ticket.companyID) continue;
+      if (!ticket.companyID || excludedCompanyIds.has(ticket.companyID)) continue;
       const breached =
         !ticket.firstResponseDateTime ||
         new Date(ticket.firstResponseDateTime) > new Date(ticket.firstResponseDueDateTime);
       if (!breached) continue;
 
-      const client = ensureClient(data, ticket.companyID);
+      const client = ensureClient(data, ticket.companyID, companyNameMap[String(ticket.companyID)]);
       if (dedupeExists(client, 'sla_breach', 'ticketId', ticket.id)) continue;
       client.events.push({
         id: `evt_${randomUUID()}`,
@@ -283,8 +346,8 @@ router.post('/sync', async (req, res) => {
       filter: [{ field: 'completeDate', op: 'gte', value: surveySince }],
     });
     for (const result of surveyResults) {
-      if (result.surveyRating == null || !result.companyID) continue;
-      const client = ensureClient(data, result.companyID);
+      if (result.surveyRating == null || !result.companyID || excludedCompanyIds.has(result.companyID)) continue;
+      const client = ensureClient(data, result.companyID, companyNameMap[String(result.companyID)]);
       if (dedupeExists(client, 'autotask_review', 'surveyResultId', result.id)) continue;
       client.events.push({
         id: `evt_${randomUUID()}`,
