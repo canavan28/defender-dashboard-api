@@ -86,4 +86,92 @@ router.get('/service-catalog', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/license-audit-raw?companyId=XXXX
+// Pulls raw Contract + ContractService + ContractServiceBundle data (plus
+// whatever unit/quantity entities actually exist) for one company — for
+// scoping the license-audit feature's user/device/partial-user quantity
+// math against REAL AutoTask structure. Not guessing field names here:
+// this project has already been burned twice by AutoTask's docs implying
+// one structure while the real API behaves differently (ContractServices
+// needing flat queries, not nested; same with Quotes). Each sub-step is
+// independently try/caught (mirrors upsells.js's processCompany
+// resilience pattern) so one entity that doesn't exist as expected
+// (e.g. if ContractServiceBundleUnits isn't real) doesn't blank the
+// whole response — we just see the error for that piece and the raw
+// data for everything else, which is itself useful diagnostic signal.
+router.get('/license-audit-raw', async (req, res) => {
+  const companyId = parseInt(req.query.companyId, 10);
+  if (!companyId) {
+    return res.status(400).json({ error: 'Pass ?companyId=XXXX in the URL' });
+  }
+  try {
+    const contractsRes = await autotaskClient.post('/Contracts/query', {
+      filter: [{ field: 'companyID', op: 'eq', value: companyId }]
+    });
+    const contracts = contractsRes.data.items || [];
+    const results = [];
+
+    for (const contract of contracts) {
+      const entry = {
+        contract: { id: contract.id, contractName: contract.contractName, status: contract.status }
+      };
+
+      try {
+        const servicesRes = await autotaskClient.post('/ContractServices/query', {
+          filter: [{ field: 'contractID', op: 'eq', value: contract.id }]
+        });
+        entry.contractServices = servicesRes.data.items || [];
+      } catch (err) {
+        entry.contractServices = { error: err.message, body: err.response?.data };
+      }
+
+      try {
+        const bundlesRes = await autotaskClient.post('/ContractServiceBundles/query', {
+          filter: [{ field: 'contractID', op: 'eq', value: contract.id }]
+        });
+        entry.contractServiceBundles = bundlesRes.data.items || [];
+      } catch (err) {
+        entry.contractServiceBundles = { error: err.message, body: err.response?.data };
+      }
+
+      // Per-service billing quantity — confirmed real entity, already used
+      // for Inside Sales MRR calculations.
+      entry.contractServiceUnits = {};
+      for (const cs of Array.isArray(entry.contractServices) ? entry.contractServices : []) {
+        try {
+          const unitsRes = await autotaskClient.post('/ContractServiceUnits/query', {
+            filter: [{ field: 'contractServiceID', op: 'eq', value: cs.id }]
+          });
+          entry.contractServiceUnits[cs.id] = unitsRes.data.items || [];
+        } catch (err) {
+          entry.contractServiceUnits[cs.id] = { error: err.message, body: err.response?.data };
+        }
+      }
+
+      // Per-bundle quantity — NOT confirmed to exist as a named entity;
+      // this is a guess at the parallel naming convention. If this 404s,
+      // that's useful: it tells us the bundle quantity must live as a
+      // plain field directly on the ContractServiceBundle record instead
+      // (already captured above in contractServiceBundles).
+      entry.contractServiceBundleUnits = {};
+      for (const csb of Array.isArray(entry.contractServiceBundles) ? entry.contractServiceBundles : []) {
+        try {
+          const unitsRes = await autotaskClient.post('/ContractServiceBundleUnits/query', {
+            filter: [{ field: 'contractServiceBundleID', op: 'eq', value: csb.id }]
+          });
+          entry.contractServiceBundleUnits[csb.id] = unitsRes.data.items || [];
+        } catch (err) {
+          entry.contractServiceBundleUnits[csb.id] = { error: err.message, body: err.response?.data };
+        }
+      }
+
+      results.push(entry);
+    }
+
+    res.json({ companyId, contracts: results });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
