@@ -264,6 +264,19 @@ async function resolveContractedCounts(companyId) {
   };
 }
 
+// GET /api/license-audit/status — safe to poll repeatedly. Only reads
+// whatever's on disk right now; never triggers a build (unlike /all, which
+// builds automatically if the cache is empty — that's the risky one to
+// poll with, since it could kick off another long run and time out again).
+router.get('/status', (req, res) => {
+  const data = loadCache();
+  res.json({
+    builtAt: data.builtAt,
+    clientCount: Object.keys(data.clients || {}).length,
+    errorCount: (data.errors || []).length,
+  });
+});
+
 // GET /api/license-audit/contracted/:companyId
 router.get('/contracted/:companyId', async (req, res) => {
   const companyId = parseInt(req.params.companyId, 10);
