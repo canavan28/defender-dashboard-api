@@ -7,6 +7,7 @@ const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
 const salesMetricsRouter = require('./routes/salesMetrics');
 const customerSuccessRouter = require('./routes/customerSuccess');
+const licenseAuditRouter = require('./routes/licenseAudit');
 const diagnosticRouter = require('./routes/diagnostic');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
 
@@ -43,6 +44,7 @@ app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
 app.use('/api/sales', salesMetricsRouter);
 app.use('/api/customer-success', customerSuccessRouter);
+app.use('/api/license-audit', licenseAuditRouter);
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
 app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
