@@ -275,6 +275,7 @@ router.get('/status', (req, res) => {
   res.json({
     builtAt: data.builtAt,
     clientCount: Object.keys(data.clients || {}).length,
+    excludedNoFullUsers: data.excludedNoFullUsers || 0,
     errorCount: (data.errors || []).length,
   });
 });
@@ -302,18 +303,29 @@ async function buildCache() {
   const companies = await fetchActiveCompanies();
   const clients = {};
   const errors = [];
+  let excludedNoFullUsers = 0;
 
   for (const company of companies) {
     try {
       const counts = await resolveContractedCounts(company.id);
-      clients[String(company.id)] = { companyName: company.companyName, ...counts };
+      // Exclude any client with no full users — either they don't have one
+      // of the four plan bundles (2/3/6/8) attached at all, or the bundle
+      // exists but has no current-period units. These clients showed zero
+      // across every other field too when spot-checked, consistent with
+      // them not being active managed-service clients for this feature's
+      // purposes (pure T&M clients, offboarded companies, etc.).
+      if (counts.fullUsers === 0) {
+        excludedNoFullUsers++;
+      } else {
+        clients[String(company.id)] = { companyName: company.companyName, ...counts };
+      }
     } catch (err) {
       errors.push({ companyId: company.id, companyName: company.companyName, message: err.message });
     }
     await sleep(PAGE_SLEEP_MS);
   }
 
-  const data = { builtAt: new Date().toISOString(), clients, errors };
+  const data = { builtAt: new Date().toISOString(), clients, errors, excludedNoFullUsers };
   saveCache(data);
   return data;
 }
