@@ -61,6 +61,7 @@ const ADDON_SERVICE_IDS = {
   vigilance: 74,
   vPenTest: 83,
   acp: 98,
+  longTermArchive: 91, // "Long Term Account Archive" — compared against SaaS Protect's Archived Seats
 };
 const COMBINED_ADDON_BUNDLE_ID = 9; // "S1 Vigilance and vPenTest"
 
@@ -439,7 +440,13 @@ router.post('/consumed/:source', async (req, res) => {
         // company; anything else just takes the latest value.
         for (const [k, v] of Object.entries(row)) {
           if (k === 'name' || k === 'devices') continue;
-          byCompany[key][k] = typeof v === 'boolean' ? (byCompany[key][k] || v) : v;
+          if (typeof v === 'boolean') {
+            byCompany[key][k] = byCompany[key][k] || v;
+          } else if (typeof v === 'number') {
+            byCompany[key][k] = (byCompany[key][k] || 0) + v;
+          } else {
+            byCompany[key][k] = v;
+          }
         }
       } else {
         const extra = {};
@@ -493,7 +500,13 @@ router.post('/consumed/:source/map', (req, res) => {
       src.byCompany[key].devices += row.devices;
       src.byCompany[key].rawNames.push(row.rawName);
       for (const [k, v] of Object.entries(row.extra || {})) {
-        src.byCompany[key][k] = typeof v === 'boolean' ? (src.byCompany[key][k] || v) : v;
+        if (typeof v === 'boolean') {
+          src.byCompany[key][k] = src.byCompany[key][k] || v;
+        } else if (typeof v === 'number') {
+          src.byCompany[key][k] = (src.byCompany[key][k] || 0) + v;
+        } else {
+          src.byCompany[key][k] = v;
+        }
       }
     }
   }
