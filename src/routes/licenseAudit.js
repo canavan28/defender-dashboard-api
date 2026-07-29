@@ -433,8 +433,20 @@ router.post('/consumed/:source', async (req, res) => {
         if (!byCompany[key]) byCompany[key] = { devices: 0, rawNames: [] };
         byCompany[key].devices += devices;
         byCompany[key].rawNames.push(rawName);
+        // Generic passthrough for any source-specific extra signal beyond
+        // name/devices (e.g. SentinelOne's Vigilance MDR add-on flag).
+        // Booleans OR together across multiple matched rows for the same
+        // company; anything else just takes the latest value.
+        for (const [k, v] of Object.entries(row)) {
+          if (k === 'name' || k === 'devices') continue;
+          byCompany[key][k] = typeof v === 'boolean' ? (byCompany[key][k] || v) : v;
+        }
       } else {
-        unmatched.push({ rawName, devices });
+        const extra = {};
+        for (const [k, v] of Object.entries(row)) {
+          if (k !== 'name' && k !== 'devices') extra[k] = v;
+        }
+        unmatched.push({ rawName, devices, extra });
       }
     }
 
@@ -480,6 +492,9 @@ router.post('/consumed/:source/map', (req, res) => {
       if (!src.byCompany[key]) src.byCompany[key] = { devices: 0, rawNames: [] };
       src.byCompany[key].devices += row.devices;
       src.byCompany[key].rawNames.push(row.rawName);
+      for (const [k, v] of Object.entries(row.extra || {})) {
+        src.byCompany[key][k] = typeof v === 'boolean' ? (src.byCompany[key][k] || v) : v;
+      }
     }
   }
 
