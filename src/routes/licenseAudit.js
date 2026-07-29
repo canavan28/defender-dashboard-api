@@ -355,4 +355,170 @@ router.get('/refresh', async (req, res) => {
   }
 });
 
+// ---- Consumed-side upload & matching (Phase 2: Datto RMM first) ----
+//
+// Design: the frontend parses whatever CSV the user uploads client-side
+// (each vendor's export format differs, but this keeps the backend generic
+// — it just receives { name, devices } rows regardless of source) and
+// POSTs the parsed rows here. Matching order: previously-confirmed manual
+// mapping > exact company name match > unmatched (needs reconciliation).
+// Manual mappings and ignored names persist forever once resolved, so a
+// re-upload of the same source never re-asks about the same row twice.
+
+const CONSUMED_DATA_FILE = '/app/data/licenseAudit-consumed.json';
+let consumedCache = null;
+
+function loadConsumedData() {
+  if (consumedCache) return consumedCache;
+  try {
+    consumedCache = JSON.parse(fs.readFileSync(CONSUMED_DATA_FILE, 'utf8'));
+  } catch (err) {
+    consumedCache = { sources: {}, nameMappings: {}, ignoredNames: {} };
+  }
+  return consumedCache;
+}
+
+function saveConsumedData(data) {
+  consumedCache = data;
+  fs.writeFileSync(CONSUMED_DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+// Broader than fetchActiveCompanies() above — no Web Dev/NJC/internal
+// exclusion here, since an upload might legitimately reference one of
+// those (e.g. "InfoTank Inventory" mapping to InfoTank itself). Exclusion
+// from the final audit view still happens downstream, same as the
+// contracted side.
+async function fetchAllCompanyNames() {
+  const companies = await queryAll('Companies', {
+    filter: [
+      { field: 'isActive', op: 'eq', value: true },
+      { field: 'companyType', op: 'eq', value: 1 },
+    ],
+  });
+  const map = {};
+  for (const c of companies) {
+    if (c.companyName) map[c.companyName.trim()] = c.id;
+  }
+  return map;
+}
+
+// POST /api/license-audit/consumed/:source
+// body: { rows: [{ name, devices }] }
+router.post('/consumed/:source', async (req, res) => {
+  const source = req.params.source;
+  const rows = req.body?.rows;
+  if (!Array.isArray(rows)) {
+    return res.status(400).json({ error: 'Body must include a rows array of { name, devices }' });
+  }
+
+  try {
+    const companyNameMap = await fetchAllCompanyNames();
+    const data = loadConsumedData();
+    if (!data.nameMappings[source]) data.nameMappings[source] = {};
+    if (!data.ignoredNames[source]) data.ignoredNames[source] = {};
+
+    const byCompany = {};
+    const unmatched = [];
+
+    for (const row of rows) {
+      const rawName = (row.name || '').trim();
+      const devices = Number(row.devices) || 0;
+      if (!rawName) continue;
+      if (data.ignoredNames[source][rawName]) continue;
+
+      const companyId = data.nameMappings[source][rawName] || companyNameMap[rawName] || null;
+
+      if (companyId) {
+        const key = String(companyId);
+        if (!byCompany[key]) byCompany[key] = { devices: 0, rawNames: [] };
+        byCompany[key].devices += devices;
+        byCompany[key].rawNames.push(rawName);
+      } else {
+        unmatched.push({ rawName, devices });
+      }
+    }
+
+    data.sources[source] = { byCompany, unmatched, uploadedAt: new Date().toISOString() };
+    saveConsumedData(data);
+
+    res.json({
+      source,
+      matchedCount: Object.keys(byCompany).length,
+      unmatchedCount: unmatched.length,
+      unmatched,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
+// GET /api/license-audit/consumed/:source
+router.get('/consumed/:source', (req, res) => {
+  const data = loadConsumedData();
+  res.json(data.sources[req.params.source] || { byCompany: {}, unmatched: [], uploadedAt: null });
+});
+
+// POST /api/license-audit/consumed/:source/map
+// body: { rawName, companyId } — records a permanent mapping and resolves
+// this row immediately, without needing to re-upload the CSV.
+router.post('/consumed/:source/map', (req, res) => {
+  const source = req.params.source;
+  const { rawName, companyId } = req.body || {};
+  if (!rawName || !companyId) {
+    return res.status(400).json({ error: 'rawName and companyId are required' });
+  }
+  const data = loadConsumedData();
+  if (!data.nameMappings[source]) data.nameMappings[source] = {};
+  data.nameMappings[source][rawName] = Number(companyId);
+
+  const src = data.sources[source];
+  if (src) {
+    const idx = src.unmatched.findIndex((u) => u.rawName === rawName);
+    if (idx !== -1) {
+      const [row] = src.unmatched.splice(idx, 1);
+      const key = String(companyId);
+      if (!src.byCompany[key]) src.byCompany[key] = { devices: 0, rawNames: [] };
+      src.byCompany[key].devices += row.devices;
+      src.byCompany[key].rawNames.push(row.rawName);
+    }
+  }
+
+  saveConsumedData(data);
+  res.json({ ok: true });
+});
+
+// POST /api/license-audit/consumed/:source/ignore
+// body: { rawName } — permanently marks a raw name as "not a real client"
+// (e.g. placeholder site names like "Managed" or "OnDemand"), so it never
+// shows up as unmatched again.
+router.post('/consumed/:source/ignore', (req, res) => {
+  const source = req.params.source;
+  const { rawName } = req.body || {};
+  if (!rawName) return res.status(400).json({ error: 'rawName is required' });
+  const data = loadConsumedData();
+  if (!data.ignoredNames[source]) data.ignoredNames[source] = {};
+  data.ignoredNames[source][rawName] = true;
+
+  const src = data.sources[source];
+  if (src) {
+    src.unmatched = src.unmatched.filter((u) => u.rawName !== rawName);
+  }
+  saveConsumedData(data);
+  res.json({ ok: true });
+});
+
+// GET /api/license-audit/companies-list — for the manual-mapping dropdown
+// in the upload reconciliation UI.
+router.get('/companies-list', async (req, res) => {
+  try {
+    const map = await fetchAllCompanyNames();
+    const list = Object.entries(map)
+      .map(([companyName, id]) => ({ id, companyName }))
+      .sort((a, b) => a.companyName.localeCompare(b.companyName));
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
