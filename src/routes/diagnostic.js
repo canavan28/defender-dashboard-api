@@ -49,4 +49,41 @@ router.get('/ghl-opportunities', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/service-catalog
+// Pulls the full Services and ServiceBundles catalog directly from
+// AutoTask, for the license-audit feature: finding exact IDs/names for
+// the 4 plan bundles, Partial User, Extra Devices, Server Remote
+// Support/Monitoring, etc. — rather than matching against what these are
+// casually called, which has already burned us once on this project
+// (e.g. "S1 Vigilance and vPenTest" turned out to actually be named
+// "Sentinel One Vigilance and vPenTest combined" in AutoTask).
+// NOTE: no pagination handling here (unlike customerSuccess.js's queryAll)
+// — if either list looks suspiciously short or the raw response includes
+// a truthy pageDetails.nextPageUrl, the catalog is larger than one page
+// and this needs pagination added before trusting it's complete.
+router.get('/service-catalog', async (req, res) => {
+  try {
+    const [servicesRes, bundlesRes] = await Promise.all([
+      autotaskClient.post('/Services/query', {
+        filter: [{ field: 'id', op: 'gte', value: 0 }]
+      }),
+      autotaskClient.post('/ServiceBundles/query', {
+        filter: [{ field: 'id', op: 'gte', value: 0 }]
+      })
+    ]);
+    res.json({
+      services: (servicesRes.data.items || [])
+        .map(s => ({ id: s.id, name: s.name, isActive: s.isActive }))
+        .sort((a, b) => a.name?.localeCompare(b.name)),
+      servicesPageDetails: servicesRes.data.pageDetails,
+      serviceBundles: (bundlesRes.data.items || [])
+        .map(b => ({ id: b.id, name: b.name, isActive: b.isActive }))
+        .sort((a, b) => a.name?.localeCompare(b.name)),
+      serviceBundlesPageDetails: bundlesRes.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
