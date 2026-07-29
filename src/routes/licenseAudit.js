@@ -34,8 +34,10 @@ function loadCache() {
   if (cache) return cache;
   try {
     cache = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    console.log(`[LicenseAuditCache] Loaded from disk, built ${cache.builtAt}, ${Object.keys(cache.clients || {}).length} clients`);
   } catch (err) {
     cache = { builtAt: null, clients: {}, errors: [] };
+    console.log('[LicenseAuditCache] No cache on disk yet');
   }
   return cache;
 }
