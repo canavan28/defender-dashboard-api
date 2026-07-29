@@ -20,11 +20,30 @@
 
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
 const { autotaskClient, getHeaders } = require('../utils/autotask');
 
 const router = express.Router();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const PAGE_SLEEP_MS = 400;
+const DATA_FILE = '/app/data/licenseAudit-cache.json';
+
+let cache = null;
+
+function loadCache() {
+  if (cache) return cache;
+  try {
+    cache = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  } catch (err) {
+    cache = { builtAt: null, clients: {}, errors: [] };
+  }
+  return cache;
+}
+
+function saveCache(data) {
+  cache = data;
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
 
 // Confirmed bundle/service IDs — see project notes for how each was
 // resolved (service-catalog pull + real-data validation against COE/Morton).
@@ -103,6 +122,44 @@ async function fetchContractRawData(companyId) {
 
   return { allServices, allBundles, serviceUnitsMap, bundleUnitsMap };
 }
+
+// Follows AutoTask's pageDetails.nextPageUrl pagination (POST, with the
+// original filter body resent — confirmed required in customerSuccess.js;
+// this instance's zone rejects GET and rejects an empty continuation body).
+async function queryAll(entity, body) {
+  let items = [];
+  const first = await autotaskClient.post(`/${entity}/query`, body);
+  items = items.concat(first.data.items || []);
+  let nextUrl = first.data.pageDetails?.nextPageUrl;
+  while (nextUrl) {
+    await sleep(PAGE_SLEEP_MS);
+    const pageRes = await axios.post(nextUrl, body, { headers: getHeaders() });
+    items = items.concat(pageRes.data.items || []);
+    nextUrl = pageRes.data.pageDetails?.nextPageUrl;
+  }
+  return items;
+}
+
+// Same "not a real billed client" exclusions as Customer Success scoring,
+// for the same underlying reason — these companies (InfoTank internal, NJC,
+// Web Dev accounts) aren't on the standard plan bundles this audit measures.
+const EXCLUDE_LICENSE_AUDIT_COMPANIES = new Set([0, 344]);
+const WEB_DEV_CLASSIFICATION = 19;
+
+// companyType: 1 = active customer companies — same filter already proven
+// in upsells.js's fetchActiveCompanies.
+async function fetchActiveCompanies() {
+  const companies = await queryAll('Companies', {
+    filter: [
+      { field: 'isActive', op: 'eq', value: true },
+      { field: 'companyType', op: 'eq', value: 1 },
+    ],
+  });
+  return companies.filter(
+    (c) => !EXCLUDE_LICENSE_AUDIT_COMPANIES.has(c.id) && Number(c.classification) !== WEB_DEV_CLASSIFICATION
+  );
+}
+
 
 // Resolves the confirmed contracted-count breakdown for one company.
 async function resolveContractedCounts(companyId) {
@@ -216,6 +273,56 @@ router.get('/contracted/:companyId', async (req, res) => {
   try {
     const result = await resolveContractedCounts(companyId);
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
+// Builds the full cache: every active client's contracted-count breakdown.
+// Mirrors upsells.js's processCompany resilience pattern — one company's
+// failure gets appended to a shared errors array rather than dropping the
+// whole batch (the exact bug class that once made COE vanish from the
+// dashboard after a single transient AutoTask error).
+async function buildCache() {
+  const companies = await fetchActiveCompanies();
+  const clients = {};
+  const errors = [];
+
+  for (const company of companies) {
+    try {
+      const counts = await resolveContractedCounts(company.id);
+      clients[String(company.id)] = { companyName: company.companyName, ...counts };
+    } catch (err) {
+      errors.push({ companyId: company.id, companyName: company.companyName, message: err.message });
+    }
+    await sleep(PAGE_SLEEP_MS);
+  }
+
+  const data = { builtAt: new Date().toISOString(), clients, errors };
+  saveCache(data);
+  return data;
+}
+
+// GET /api/license-audit/all — serves the cache, building it first if empty
+router.get('/all', async (req, res) => {
+  try {
+    let data = loadCache();
+    if (!data.builtAt) {
+      data = await buildCache();
+    }
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
+// GET /api/license-audit/refresh — forces a full rebuild (slow — many
+// sequential AutoTask calls per company, paced with sleeps, same tradeoff
+// as upsells.js's /refresh).
+router.get('/refresh', async (req, res) => {
+  try {
+    const data = await buildCache();
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message, body: err.response?.data });
   }
