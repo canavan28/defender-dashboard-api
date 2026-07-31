@@ -80,6 +80,40 @@ app.get('/api/me', (req, res) => {
   res.json({ oid, name, email, isOwner, categories, defaultCategory, defaultTab });
 });
 
+// GET /api/me/preview-list — owner-only. Names/oids of everyone in the
+// access config, for the "preview as" dropdown. Requires requireOwner (see
+// below), mounted after the global verifyApiKey so req.user is populated.
+app.get('/api/me/preview-list', requireOwner, (req, res) => {
+  const list = Object.entries(userAccessConfig).map(([oid, access]) => ({
+    oid, name: access.name
+  }));
+  res.json(list);
+});
+
+// GET /api/me/preview/:oid — owner-only. Returns exactly what /api/me would
+// return FOR that person, without needing their actual credentials — lets
+// an owner test category access/default-tab behavior for every configured
+// person before deploying, using only their own login. Does not change who
+// is actually authenticated; this is a read-only lookup against the same
+// config /api/me itself reads.
+app.get('/api/me/preview/:oid', requireOwner, (req, res) => {
+  const targetOid = req.params.oid;
+  const access = userAccessConfig[targetOid];
+  if (!access) {
+    return res.status(404).json({ error: 'No access config found for that oid' });
+  }
+  res.json({
+    oid: targetOid,
+    name: access.name,
+    email: null,
+    isOwner: false, // owners are never in this config file, so previewing one is never possible here
+    categories: access.categories,
+    defaultCategory: access.defaultCategory,
+    defaultTab: access.defaultTab,
+    isPreview: true
+  });
+});
+
 app.use('/api/tickets', ticketsRouter);
 app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
