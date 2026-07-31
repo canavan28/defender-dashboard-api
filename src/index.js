@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 const ticketsRouter = require('./routes/tickets');
 const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
@@ -34,8 +36,48 @@ app.get('/health', (req, res) => {
 
 app.use('/api', verifyApiKey);
 
+// Per-person category access + default landing tab. Ships as part of the
+// backend code (not a runtime-editable disk file like vtos.json/reviewed.json
+// — updating who has access to what requires a commit + redeploy, same
+// friction as OWNER_OBJECT_IDS today, just structured data instead of a
+// flat env var list). Owners (Matt, Chris) are NOT in this file — they get
+// full access via the existing isOwner flag, computed separately below.
+const USER_ACCESS_PATH = path.join(__dirname, 'config', 'userAccess.json');
+let userAccessConfig = {};
+try {
+  userAccessConfig = JSON.parse(fs.readFileSync(USER_ACCESS_PATH, 'utf8'));
+} catch (err) {
+  console.error('[UserAccess] Failed to load config:', err.message);
+}
+
+const ALL_CATEGORIES = ['operations', 'sales', 'customer-success', 'finance'];
+
 app.get('/api/me', (req, res) => {
-  res.json({ oid: req.user.oid, name: req.user.name, email: req.user.email, isOwner: req.user.isOwner });
+  const { oid, name, email, isOwner } = req.user;
+  let categories, defaultCategory, defaultTab;
+
+  if (isOwner) {
+    categories = [...ALL_CATEGORIES, 'executive'];
+    defaultCategory = 'executive';
+    defaultTab = null; // lands on the Executive category's default sub-view (VTO for now, Tier 1 summary later)
+  } else {
+    const access = userAccessConfig[oid];
+    if (access) {
+      categories = access.categories;
+      defaultCategory = access.defaultCategory;
+      defaultTab = access.defaultTab;
+    } else {
+      // Fail closed for anyone not explicitly configured — matches the
+      // isOwner check's own fail-closed pattern (never show access
+      // optimistically). Logged so a missing config entry is visible.
+      categories = ['operations'];
+      defaultCategory = 'operations';
+      defaultTab = null;
+      console.warn('[UserAccess] No access config found for oid:', oid);
+    }
+  }
+
+  res.json({ oid, name, email, isOwner, categories, defaultCategory, defaultTab });
 });
 
 app.use('/api/tickets', ticketsRouter);

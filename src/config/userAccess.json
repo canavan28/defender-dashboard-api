@@ -1,0 +1,32 @@
+{
+  "b18cac15-5643-423a-9ead-8af3c5d599bb": {
+    "name": "Ali Sellers",
+    "categories": ["operations", "sales", "customer-success"],
+    "defaultCategory": "customer-success",
+    "defaultTab": "Customer Success"
+  },
+  "3425a01c-88f9-4c08-b3aa-ff504736db74": {
+    "name": "Avery Sellers",
+    "categories": ["operations", "sales", "customer-success"],
+    "defaultCategory": "sales",
+    "defaultTab": "Inside Sales"
+  },
+  "295c1e41-3232-4f3a-abf4-a169cc055ce6": {
+    "name": "Brandon Emby",
+    "categories": ["operations", "sales", "customer-success"],
+    "defaultCategory": "operations",
+    "defaultTab": "Ticket overview"
+  },
+  "18b456d7-e1c0-47e3-ae91-aa546fc38c25": {
+    "name": "Brianna Canavan",
+    "categories": ["operations", "sales", "customer-success", "finance"],
+    "defaultCategory": "finance",
+    "defaultTab": null
+  },
+  "a7bd64b0-ae36-4211-be1f-54177472524e": {
+    "name": "Chris McDaniel",
+    "categories": ["operations", "sales", "customer-success"],
+    "defaultCategory": "customer-success",
+    "defaultTab": "Customer Success"
+  }
+}
