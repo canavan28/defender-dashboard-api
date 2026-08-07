@@ -6,9 +6,10 @@ const router = express.Router();
 
 const DATA_DIR = '/app/data';
 const ROCKS_FILE = path.join(DATA_DIR, 'teamrocks.json');
+const VTO_FILE = path.join(DATA_DIR, 'vtos.json');
 
 // No requireOwner here — this tab is open to anyone who can log into the
-// dashboard at all (verifyApiKey, mounted in index.js, is the only gate).
+// dashboard at all (verifyApiKey, mounted globally in index.js, is the only gate).
 
 // ---- Storage helpers ----
 
@@ -36,97 +37,63 @@ function setPath(obj, pathParts, value) {
   return clone;
 }
 
-function slugify(str) {
-  return String(str)
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
-function makeId(manager, quarter) {
-  return `rocks-${slugify(manager)}-${quarter}`;
-}
-
-// Current quarter as "YYYY-Qn", e.g. "2026-Q3".
 function currentQuarter() {
   const now = new Date();
   const q = Math.floor(now.getMonth() / 3) + 1;
   return `${now.getFullYear()}-Q${q}`;
 }
 
-// Find this manager's most recent record strictly before the given quarter
-// (string-sortable since "YYYY-Qn" sorts correctly lexicographically).
-function mostRecentForManager(store, manager, beforeQuarter) {
-  const slug = slugify(manager);
+function makeId(quarter) {
+  return `rocks-${quarter}`;
+}
+
+// Most recent record strictly before the given quarter — "YYYY-Qn" sorts
+// correctly as a plain string, so no date parsing needed.
+function mostRecentBefore(store, quarter) {
   const matches = Object.values(store.records || {})
-    .filter(r => slugify(r.manager) === slug && r.quarter < beforeQuarter)
+    .filter(r => r.quarter < quarter)
     .sort((a, b) => (a.quarter < b.quarter ? 1 : -1));
   return matches[0] || null;
 }
 
-function newMeetingRecord(manager, quarter, prev) {
-  const now = new Date().toISOString();
-  return {
-    id: makeId(manager, quarter),
-    manager,
-    quarter,
-    status: 'draft',
-    createdAt: now,
-    updatedAt: now,
-    finalizedAt: null,
-    issues: [],
-    rocks: [], // { desc, owner }
-    prevQuarterId: prev ? prev.id : null,
-  };
+// Read the most recent VTO's coreValues + coreFocus for read-only meeting
+// reference at the top of the page. Reads vtos.json directly rather than
+// importing vto.js, since this route has no other dependency on that
+// module. Picks the latest by year regardless of draft/final status,
+// mirroring vto.js's own mostRecentVto logic used for next-year pre-fill.
+// Returns null if no VTO exists yet or the file can't be read — the
+// frontend just omits the reference sections in that case.
+function latestVisionRef() {
+  try {
+    const raw = fs.readFileSync(VTO_FILE, 'utf8');
+    const vtoStore = JSON.parse(raw);
+    const all = Object.values(vtoStore.vtos || {});
+    if (all.length === 0) return null;
+    const latest = all.sort((a, b) => Number(b.year) - Number(a.year))[0];
+    return {
+      sourceYear: latest.year,
+      coreValues: latest.vision?.coreValues || [],
+      coreFocus: latest.vision?.coreFocus || { purpose: '', niche: '' },
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 // ---- Routes ----
+// Every route is keyed by :quarter (e.g. "2026-Q3") rather than an opaque
+// id — the id is deterministic (rocks-<quarter>) so the frontend never
+// needs to track one separately from the quarter it's already displaying.
 
-// GET /api/team-rocks?quarter=2026-Q3 — rollup summary, optionally filtered
-// to one quarter. Defaults to the current quarter if not specified.
-router.get('/', (req, res) => {
+// GET /api/team-rocks/:quarter — full record, with the prior quarter's
+// rocks/issues and the latest VTO's coreValues/coreFocus embedded read-only.
+// 404 if this quarter's meeting hasn't been started yet.
+router.get('/:quarter', (req, res) => {
   try {
     const store = loadStore();
-    const quarter = req.query.quarter || currentQuarter();
-    const list = Object.values(store.records)
-      .filter(r => r.quarter === quarter)
-      .map(r => ({
-        id: r.id,
-        manager: r.manager,
-        quarter: r.quarter,
-        status: r.status,
-        rocksCount: r.rocks?.length || 0,
-        issuesCount: r.issues?.length || 0,
-        updatedAt: r.updatedAt,
-      }))
-      .sort((a, b) => a.manager.localeCompare(b.manager));
-    res.json({ quarter, records: list });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /api/team-rocks/managers — distinct manager names seen so far, for
-// populating a "pick existing or type new" control when starting a meeting.
-router.get('/managers', (req, res) => {
-  try {
-    const store = loadStore();
-    const names = [...new Set(Object.values(store.records).map(r => r.manager))].sort();
-    res.json({ managers: names });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /api/team-rocks/:id — full record, with the prior quarter's rocks/
-// issues embedded read-only (if one exists) so the frontend doesn't need a
-// second round trip to show carry-forward context at the start of a meeting.
-router.get('/:id', (req, res) => {
-  try {
-    const store = loadStore();
-    const record = store.records[req.params.id];
-    if (!record) return res.status(404).json({ error: 'Record not found' });
+    const id = makeId(req.params.quarter);
+    const record = store.records[id];
+    if (!record) return res.status(404).json({ error: 'No meeting started for this quarter yet' });
 
     const prevQuarter = record.prevQuarterId
       ? store.records[record.prevQuarterId] || null
@@ -137,29 +104,38 @@ router.get('/:id', (req, res) => {
       prevQuarter: prevQuarter
         ? { id: prevQuarter.id, quarter: prevQuarter.quarter, rocks: prevQuarter.rocks, issues: prevQuarter.issues }
         : null,
+      visionRef: latestVisionRef(),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/team-rocks — start a new quarter's meeting for a manager.
-// Body: { manager: string, quarter?: string }  (quarter defaults to current)
-// Auto-links prevQuarterId to that manager's most recent earlier record, if any.
+// POST /api/team-rocks — start a quarter's meeting.
+// Body: { quarter?: string } (defaults to current quarter)
+// Auto-links prevQuarterId to the most recent earlier quarter's record, if any.
 router.post('/', (req, res) => {
   try {
-    const manager = (req.body?.manager || '').trim();
-    if (!manager) return res.status(400).json({ error: 'manager is required' });
     const quarter = req.body?.quarter || currentQuarter();
-
     const store = loadStore();
-    const id = makeId(manager, quarter);
+    const id = makeId(quarter);
     if (store.records[id]) {
-      return res.status(409).json({ error: `A record for ${manager} in ${quarter} already exists` });
+      return res.status(409).json({ error: `A meeting for ${quarter} already exists` });
     }
 
-    const prev = mostRecentForManager(store, manager, quarter);
-    const record = newMeetingRecord(manager, quarter, prev);
+    const prev = mostRecentBefore(store, quarter);
+    const now = new Date().toISOString();
+    const record = {
+      id,
+      quarter,
+      status: 'draft',
+      createdAt: now,
+      updatedAt: now,
+      finalizedAt: null,
+      issues: [],
+      rocks: [], // { desc, owner }
+      prevQuarterId: prev ? prev.id : null,
+    };
     store.records[id] = record;
     saveStore(store);
 
@@ -169,10 +145,10 @@ router.post('/', (req, res) => {
   }
 });
 
-// PATCH /api/team-rocks/:id — update one field path (autosave-friendly)
+// PATCH /api/team-rocks/:quarter — update one field path (autosave-friendly)
 // Body: { path: string[], value: any }
 // Finalized records reject edits unless unlocked first.
-router.patch('/:id', (req, res) => {
+router.patch('/:quarter', (req, res) => {
   try {
     const { path: fieldPath, value } = req.body;
     if (!Array.isArray(fieldPath) || fieldPath.length === 0) {
@@ -180,16 +156,17 @@ router.patch('/:id', (req, res) => {
     }
 
     const store = loadStore();
-    const existing = store.records[req.params.id];
-    if (!existing) return res.status(404).json({ error: 'Record not found' });
+    const id = makeId(req.params.quarter);
+    const existing = store.records[id];
+    if (!existing) return res.status(404).json({ error: 'No meeting started for this quarter yet' });
 
     if (existing.status === 'final') {
-      return res.status(423).json({ error: 'Record is finalized and locked. Unlock before editing.' });
+      return res.status(423).json({ error: 'Meeting is finalized and locked. Unlock before editing.' });
     }
 
     const updated = setPath(existing, fieldPath, value);
     updated.updatedAt = new Date().toISOString();
-    store.records[req.params.id] = updated;
+    store.records[id] = updated;
     saveStore(store);
 
     res.json({ ok: true, updatedAt: updated.updatedAt });
@@ -198,18 +175,19 @@ router.patch('/:id', (req, res) => {
   }
 });
 
-// POST /api/team-rocks/:id/finalize — lock the record once the meeting is done.
-router.post('/:id/finalize', (req, res) => {
+// POST /api/team-rocks/:quarter/finalize — lock once the meeting is done.
+router.post('/:quarter/finalize', (req, res) => {
   try {
     const store = loadStore();
-    const existing = store.records[req.params.id];
-    if (!existing) return res.status(404).json({ error: 'Record not found' });
+    const id = makeId(req.params.quarter);
+    const existing = store.records[id];
+    if (!existing) return res.status(404).json({ error: 'No meeting started for this quarter yet' });
 
     existing.status = 'final';
     existing.finalizedAt = new Date().toISOString();
     existing.updatedAt = existing.finalizedAt;
 
-    store.records[req.params.id] = existing;
+    store.records[id] = existing;
     saveStore(store);
 
     res.json(existing);
@@ -218,20 +196,21 @@ router.post('/:id/finalize', (req, res) => {
   }
 });
 
-// POST /api/team-rocks/:id/unlock — reopen a finalized record for correction.
+// POST /api/team-rocks/:quarter/unlock — reopen a finalized meeting for correction.
 // No owner gate — loose by design, since this tab has no role tier at all.
-router.post('/:id/unlock', (req, res) => {
+router.post('/:quarter/unlock', (req, res) => {
   try {
     const store = loadStore();
-    const existing = store.records[req.params.id];
-    if (!existing) return res.status(404).json({ error: 'Record not found' });
+    const id = makeId(req.params.quarter);
+    const existing = store.records[id];
+    if (!existing) return res.status(404).json({ error: 'No meeting started for this quarter yet' });
 
     existing.status = 'draft';
     existing.finalizedAt = null;
     existing.updatedAt = new Date().toISOString();
-    console.warn(`[TeamRocks] ${req.user?.name || req.user?.oid} unlocked ${req.params.id}`);
+    console.warn(`[TeamRocks] ${req.user?.name || req.user?.oid} unlocked ${id}`);
 
-    store.records[req.params.id] = existing;
+    store.records[id] = existing;
     saveStore(store);
 
     res.json(existing);
@@ -240,25 +219,26 @@ router.post('/:id/unlock', (req, res) => {
   }
 });
 
-// DELETE /api/team-rocks/:id — finalized records require ?force=true.
-router.delete('/:id', (req, res) => {
+// DELETE /api/team-rocks/:quarter — finalized records require ?force=true.
+router.delete('/:quarter', (req, res) => {
   try {
     const store = loadStore();
-    const existing = store.records[req.params.id];
-    if (!existing) return res.status(404).json({ error: 'Record not found' });
+    const id = makeId(req.params.quarter);
+    const existing = store.records[id];
+    if (!existing) return res.status(404).json({ error: 'No meeting started for this quarter yet' });
 
     if (existing.status === 'final' && req.query.force !== 'true') {
       return res.status(409).json({
-        error: `${req.params.id} is finalized. Add ?force=true to delete a finalized record.`
+        error: `${id} is finalized. Add ?force=true to delete a finalized meeting.`
       });
     }
 
-    delete store.records[req.params.id];
+    delete store.records[id];
     saveStore(store);
 
-    console.warn(`[TeamRocks] ${req.user?.name || req.user?.oid} deleted ${req.params.id} (was status: ${existing.status})`);
+    console.warn(`[TeamRocks] ${req.user?.name || req.user?.oid} deleted ${id} (was status: ${existing.status})`);
 
-    res.json({ ok: true, deleted: req.params.id });
+    res.json({ ok: true, deleted: id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
