@@ -30,6 +30,18 @@ const SCHEDULED_STATUS_LABELS = { 22: 'Scheduled - Phone Call', 41: 'Scheduled -
 // already builds using this exact status exclusion, so we don't even need to
 // re-apply the filter ourselves here.
 
+// Web Dev exclusion for dragging tickets — confirmed via /api/diagnostic/
+// ticket-fields this session. Tickets have NO department field at all
+// (unlike Projects/Tasks), so this uses queueID (29683481 = "Web
+// Development") and issueType (19 = "Web Development") instead. The
+// queueID check is likely already redundant with tickets.js's own
+// INCLUDE_QUEUES list (which omits 29683481), but is kept here as an
+// explicit, self-contained safeguard rather than relying on that
+// upstream list never changing. issueType is the one doing real work,
+// since Web Dev tickets can still land in a shared/general queue.
+const WEB_DEV_QUEUE_ID = 29683481;
+const WEB_DEV_ISSUE_TYPE = 19;
+
 // Dragging-ticket thresholds — confirmed with Matt, all three are OR'd, not AND'd
 const DRAGGING_DAYS_OPEN_THRESHOLD = 3;
 const DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD = 48;
@@ -171,26 +183,29 @@ router.get('/data', async (req, res, next) => {
     // ── Dragging tickets — needs a live time-entry count per open ticket ───
     const timeEntryCounts = await fetchTimeEntryCounts(openTickets.map(t => t.id));
 
-    const draggingTicketsRaw = openTickets.map(t => {
-      const created = t.createDate ? new Date(t.createDate).getTime() : null;
-      const daysOpen = created ? (nowMs - created) / (1000 * 60 * 60 * 24) : null;
-      const lastActivity = t.lastActivityDate ? new Date(t.lastActivityDate).getTime() : null;
-      const hoursSinceActivity = lastActivity ? (nowMs - lastActivity) / (1000 * 60 * 60) : null;
-      const timeEntryCount = timeEntryCounts[t.id] || 0;
+    const draggingTicketsRaw = openTickets
+      .filter(t => t.queueID !== WEB_DEV_QUEUE_ID && t.issueType !== WEB_DEV_ISSUE_TYPE)
+      .map(t => {
+        const created = t.createDate ? new Date(t.createDate).getTime() : null;
+        const daysOpen = created ? (nowMs - created) / (1000 * 60 * 60 * 24) : null;
+        const lastActivity = t.lastActivityDate ? new Date(t.lastActivityDate).getTime() : null;
+        const hoursSinceActivity = lastActivity ? (nowMs - lastActivity) / (1000 * 60 * 60) : null;
+        const timeEntryCount = timeEntryCounts[t.id] || 0;
 
-      const reasons = [];
-      if (daysOpen != null && daysOpen > DRAGGING_DAYS_OPEN_THRESHOLD) {
-        reasons.push(`Open ${daysOpen.toFixed(1)} days`);
-      }
-      if (hoursSinceActivity != null && hoursSinceActivity > DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD) {
-        reasons.push(`No update in ${Math.round(hoursSinceActivity)}h`);
-      }
-      if (timeEntryCount > DRAGGING_TIME_ENTRY_THRESHOLD) {
-        reasons.push(`${timeEntryCount} time entries logged`);
-      }
+        const reasons = [];
+        if (daysOpen != null && daysOpen > DRAGGING_DAYS_OPEN_THRESHOLD) {
+          reasons.push(`Open ${daysOpen.toFixed(1)} days`);
+        }
+        if (hoursSinceActivity != null && hoursSinceActivity > DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD) {
+          reasons.push(`No update in ${Math.round(hoursSinceActivity)}h`);
+        }
+        if (timeEntryCount > DRAGGING_TIME_ENTRY_THRESHOLD) {
+          reasons.push(`${timeEntryCount} time entries logged`);
+        }
 
-      return { ticket: t, daysOpen, hoursSinceActivity, timeEntryCount, reasons };
-    }).filter(d => d.reasons.length > 0);
+        return { ticket: t, daysOpen, hoursSinceActivity, timeEntryCount, reasons };
+      })
+      .filter(d => d.reasons.length > 0);
 
     // ── AI Review escalations — direct read of reviewed.json's flags array ─
     // Restricted to the last 7 days (by dateFlagged, not the underlying
