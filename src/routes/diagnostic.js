@@ -257,4 +257,22 @@ router.get('/project-tasks-raw', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/task-fields
+// Same purpose as /project-fields but for the Tasks entity — decoding the
+// status picklist (we saw values 1, 8, 10, 24 on SharePoint Project's
+// tasks with no way yet to tell which of those mean "done" vs "not
+// started" vs "in progress"). Also worth checking here whether there's
+// any field resembling a REAL per-task due date distinct from
+// startDateTime/endDateTime, since those two were identical across every
+// task on the one project tested so far — a strong signal they're not
+// being used as real per-task scheduling.
+router.get('/task-fields', async (req, res) => {
+  try {
+    const response = await autotaskClient.get('/Tasks/entityInformation/fields');
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
