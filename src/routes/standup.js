@@ -193,8 +193,17 @@ router.get('/data', async (req, res, next) => {
     }).filter(d => d.reasons.length > 0);
 
     // ── AI Review escalations — direct read of reviewed.json's flags array ─
+    // Restricted to the last 7 days (by dateFlagged, not the underlying
+    // ticket's age — a ticket can be old but only just got flagged, or
+    // vice versa) since this is a DAILY standup, not a running backlog of
+    // every unactioned flag going back months.
+    const sevenDaysAgoMs = nowMs - 7 * 24 * 60 * 60 * 1000;
     const reviewedData = loadJsonFile(REVIEWED_FILE);
-    const aiEscalations = (reviewedData?.flags || []).filter(f => f.action === 'unactioned');
+    const aiEscalations = (reviewedData?.flags || []).filter(f =>
+      f.action === 'unactioned' &&
+      f.dateFlagged &&
+      new Date(f.dateFlagged).getTime() >= sevenDaysAgoMs
+    );
 
     // ── Engineering projects ────────────────────────────────────────────────
     const engineeringProjectsRaw = await fetchOpenProjects([

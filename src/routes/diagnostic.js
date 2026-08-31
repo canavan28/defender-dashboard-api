@@ -275,4 +275,21 @@ router.get('/task-fields', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/ticket-fields
+// Same purpose as /project-fields and /task-fields, but for the Ticket
+// entity — needed to confirm whether Tickets even HAVE a department field
+// at all, and if so, whether it reuses the same picklist values we've
+// already decoded on Projects/Tasks (29683471 = Engineering, 29683484 =
+// Web Development). Tasks turned out to reuse Ticket's status picklist,
+// but that does NOT prove the reverse is true for department — nothing
+// here is assumed until this comes back.
+router.get('/ticket-fields', async (req, res) => {
+  try {
+    const response = await autotaskClient.get('/Tickets/entityInformation/fields');
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
