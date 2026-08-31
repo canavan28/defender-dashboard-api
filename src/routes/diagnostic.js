@@ -174,4 +174,87 @@ router.get('/license-audit-raw', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// Standup feature exploration (Projects / ProjectTasks) — added this
+// session. We have NEVER queried Projects or project-task entities
+// anywhere in this codebase before now, so nothing below assumes field
+// names are what they sound like. Everything returns raw, undecorated
+// AutoTask objects so real field names/shapes can be read directly from
+// the response rather than guessed at.
+// ---------------------------------------------------------------------
+
+// GET /api/diagnostic/project-fields
+// Pulls AutoTask's field metadata for the Projects entity. AutoTask's
+// REST API convention (used elsewhere by other MSP integrations, NOT yet
+// confirmed working on this zone) is a GET to {Entity}/entityInformation/
+// fields, which — for picklist fields like status or department — should
+// include the list of valid values and their integer IDs. If this 404s
+// or comes back empty, that tells us department/status are NOT picklists
+// on this instance (e.g. department might be a plain free-text or a
+// lookup to a separate Departments entity instead), which is itself
+// useful and something we'd need to handle differently.
+router.get('/project-fields', async (req, res) => {
+  try {
+    const response = await autotaskClient.get('/Projects/entityInformation/fields');
+    res.json(response.data);
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
+// GET /api/diagnostic/projects-raw?name=Onboarding
+// Searches Projects by name (contains match, since onboarding project
+// names are confirmed NOT standardized — "Company X Onboarding",
+// "Onboarding Company X", "Onboarding Template Company X" all seen in
+// real use) and returns the FULL raw item for each match — no field
+// picking, since we don't yet know what department/status actually look
+// like on a real record. The 'contains' filter op is not yet confirmed
+// to work on this AutoTask zone (only 'eq', 'gte', and 'exist' have been
+// tested so far in this project) — if this 400s, that's the signal to
+// fall back to pulling a broader set and filtering in JS instead.
+router.get('/projects-raw', async (req, res) => {
+  const name = req.query.name;
+  if (!name) {
+    return res.status(400).json({ error: 'Pass ?name=SearchTerm in the URL' });
+  }
+  try {
+    const response = await autotaskClient.post('/Projects/query', {
+      filter: [{ field: 'projectName', op: 'contains', value: name }]
+    });
+    res.json({
+      searchTerm: name,
+      items: response.data.items || [],
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
+// GET /api/diagnostic/project-tasks-raw?projectId=XXXX
+// Pulls raw task records for a given project ID. Field name for the
+// project-task entity ('Tasks' vs 'ProjectTasks') and its filter field
+// ('projectID' vs something else) are both unconfirmed guesses based on
+// AutoTask's general naming pattern elsewhere (contractID, companyID,
+// etc.) — if this 404s or the filter field is wrong, the error body will
+// tell us so we can correct it rather than silently returning nothing.
+router.get('/project-tasks-raw', async (req, res) => {
+  const projectId = parseInt(req.query.projectId, 10);
+  if (!projectId) {
+    return res.status(400).json({ error: 'Pass ?projectId=XXXX in the URL' });
+  }
+  try {
+    const response = await autotaskClient.post('/Tasks/query', {
+      filter: [{ field: 'projectID', op: 'eq', value: projectId }]
+    });
+    res.json({
+      projectId,
+      items: response.data.items || [],
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
