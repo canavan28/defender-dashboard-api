@@ -292,4 +292,44 @@ router.get('/ticket-fields', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/resource-search?name=Lozier
+// Looks up Resources by last or first name, INCLUDING inactive ones —
+// needed specifically because Mark Lamson is no longer an employee and
+// would be silently excluded by any isActive:true filter (like the one
+// standup.js's fetchResourceNames() uses for display purposes). We still
+// need his real numeric ID to exclude his historical tickets from the
+// dragging list, even though he's inactive. 'contains' is confirmed
+// working on Projects/query this session but not yet tested on
+// Resources/query — if this 400s, that's the signal to fall back to
+// 'eq' with an exact name instead.
+router.get('/resource-search', async (req, res) => {
+  const name = req.query.name;
+  if (!name) {
+    return res.status(400).json({ error: 'Pass ?name=SearchTerm in the URL' });
+  }
+  try {
+    const response = await autotaskClient.post('/Resources/query', {
+      filter: [{
+        op: 'or',
+        items: [
+          { field: 'lastName', op: 'contains', value: name },
+          { field: 'firstName', op: 'contains', value: name }
+        ]
+      }]
+    });
+    res.json({
+      searchTerm: name,
+      items: (response.data.items || []).map(r => ({
+        id: r.id,
+        firstName: r.firstName,
+        lastName: r.lastName,
+        isActive: r.isActive,
+        licenseType: r.licenseType
+      }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
