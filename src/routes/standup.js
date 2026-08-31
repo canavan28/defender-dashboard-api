@@ -42,6 +42,16 @@ const SCHEDULED_STATUS_LABELS = { 22: 'Scheduled - Phone Call', 41: 'Scheduled -
 const WEB_DEV_QUEUE_ID = 29683481;
 const WEB_DEV_ISSUE_TYPE = 19;
 
+// Web Dev team members — confirmed via /api/diagnostic/resource-search
+// this session. Notably, these exact three IDs already appear in
+// tickets.js's own EXCLUDE_RESOURCES list (used there for time-entry/
+// response-time exclusions) — a strong independent confirmation these
+// are the right people. Mark Lamson shows isActive:true in AutoTask
+// despite no longer being an employee per Matt — that's a stale AutoTask
+// record, not a bug here; his ID is still valid for excluding his past
+// tickets regardless of his current active status.
+const WEB_DEV_RESOURCE_IDS = new Set([29682893, 29682894, 29682895]); // Joe Lozier, Carissa Malone, Mark Lamson
+
 // Dragging-ticket thresholds — confirmed with Matt, all three are OR'd, not AND'd
 const DRAGGING_DAYS_OPEN_THRESHOLD = 3;
 const DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD = 48;
@@ -184,7 +194,11 @@ router.get('/data', async (req, res, next) => {
     const timeEntryCounts = await fetchTimeEntryCounts(openTickets.map(t => t.id));
 
     const draggingTicketsRaw = openTickets
-      .filter(t => t.queueID !== WEB_DEV_QUEUE_ID && t.issueType !== WEB_DEV_ISSUE_TYPE)
+      .filter(t =>
+        t.queueID !== WEB_DEV_QUEUE_ID &&
+        t.issueType !== WEB_DEV_ISSUE_TYPE &&
+        !WEB_DEV_RESOURCE_IDS.has(t.assignedResourceID)
+      )
       .map(t => {
         const created = t.createDate ? new Date(t.createDate).getTime() : null;
         const daysOpen = created ? (nowMs - created) / (1000 * 60 * 60 * 24) : null;
