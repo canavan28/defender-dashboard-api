@@ -12,6 +12,22 @@ const CACHE_DIR = '/app/data';
 const CACHE_FILE = path.join(CACHE_DIR, 'upsells-cache.json');
 let cache = null;
 
+// ── Build status tracking ──────────────────────────────────────────────────
+// Tracks the state of the background rebuild job so /refresh can return
+// immediately instead of making the HTTP request wait for the full multi-
+// minute AutoTask loop to finish (that wait is what was exceeding Railway's
+// proxy timeout and showing up in the browser as a CORS/502 failure - the
+// request was being killed by the proxy before Express ever got to send a
+// response). `isBuilding` doubles as a lock so a second refresh click (or
+// /all finding an empty cache) can't kick off an overlapping rebuild.
+let buildStatus = {
+  status: 'idle',       // 'idle' | 'running' | 'done' | 'error'
+  startedAt: null,
+  finishedAt: null,
+  error: null
+};
+let isBuilding = false;
+
 function ensureCacheDir() {
   if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
@@ -291,25 +307,59 @@ async function buildCache() {
   return newCache;
 }
 
+// Runs the rebuild in the background - NOT awaited by the route handler that
+// calls it. This is the actual fix for the 502/CORS-looking failure: the
+// HTTP request that starts this returns right away, so there's nothing for
+// Railway's proxy to time out on. The frontend finds out the job is done by
+// polling GET /status instead of waiting on this promise.
+async function runBackgroundBuild() {
+  if (isBuilding) {
+    console.log('[UpsellsCache] Build already in progress, ignoring duplicate trigger.');
+    return;
+  }
+  isBuilding = true;
+  buildStatus = { status: 'running', startedAt: new Date().toISOString(), finishedAt: null, error: null };
+
+  try {
+    cache = await buildCache();
+    buildStatus = { status: 'done', startedAt: buildStatus.startedAt, finishedAt: new Date().toISOString(), error: null };
+  } catch (err) {
+    console.error('[UpsellsCache] Background build failed:', err.message);
+    buildStatus = { status: 'error', startedAt: buildStatus.startedAt, finishedAt: new Date().toISOString(), error: err.message };
+  } finally {
+    isBuilding = false;
+  }
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────
+
+// Always serves whatever is in the cache (stale or empty) - never triggers a
+// build itself. If there's no cache yet, hasData:false tells the frontend to
+// prompt for a refresh instead of silently starting a multi-minute rebuild
+// with no visible progress on page load.
 router.get('/all', async (req, res, next) => {
   try {
     if (!cache) {
-      cache = await buildCache();
+      return res.json({ companies: [], builtAt: null, processingErrors: [], hasData: false });
     }
-    res.json(cache);
+    res.json({ ...cache, hasData: true });
   } catch (err) {
     next(err);
   }
 });
 
-router.get('/refresh', async (req, res, next) => {
-  try {
-    cache = await buildCache();
-    res.json({ ok: true, totalCompanies: cache.companies.length, builtAt: cache.builtAt, processingErrors: cache.processingErrors });
-  } catch (err) {
-    next(err);
+// Safe to poll - just reads in-memory status, never touches AutoTask.
+router.get('/status', (req, res) => {
+  res.json({ ...buildStatus, isBuilding, hasCache: !!cache, builtAt: cache?.builtAt || null });
+});
+
+// Fires the rebuild and returns immediately - does not wait for it to finish.
+router.get('/refresh', (req, res) => {
+  if (isBuilding) {
+    return res.status(409).json({ ok: false, message: 'A refresh is already running.', ...buildStatus });
   }
+  runBackgroundBuild();
+  res.status(202).json({ ok: true, message: 'Refresh started.', status: 'running' });
 });
 
 module.exports = router;
