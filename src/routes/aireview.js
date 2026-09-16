@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const { autotaskClient, getHeaders } = require('../utils/autotask');
+const { requireOwner } = require('../middleware/auth');
 
 const DATA_FILE = '/app/data/reviewed.json';
 const AUTOTASK_ZONE = (process.env.AUTOTASK_ZONE_URL || '').replace('/ATServicesRest', '') || 'https://ww14.autotask.net';
@@ -245,6 +246,60 @@ function baseReviewMetadata(t, now) {
     wasEscalated,
     resolutionDays
   };
+}
+
+// ── One-time cleanup: bulk-resolve ticketNumber -> internal ticket ID ────────
+// Existing flags in data.flags only store ticketNumber (e.g. "T20260727.0017"),
+// not the internal numeric ID that TicketNotes queries need. Confirmed via
+// diagnostic testing that AutoTask's 'in' operator works on the ticketNumber
+// field (a string field) — same chunk/pagination pattern as elsewhere in this file.
+async function fetchTicketIdsByNumbers(ticketNumbers) {
+  const map = {};
+  const CHUNK = 500;
+  for (let i = 0; i < ticketNumbers.length; i += CHUNK) {
+    const chunk = ticketNumbers.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketNumber', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(t => { map[t.ticketNumber] = t.id; });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(t => { map[t.ticketNumber] = t.id; });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not resolve a chunk of ticket numbers to IDs:', err.message);
+    }
+    if (i + CHUNK < ticketNumbers.length) await new Promise(r => setTimeout(r, 300));
+  }
+  return map;
+}
+
+// ── One-time cleanup: find which existing flags match the auto-close pattern ──
+// Shared by the preview and apply routes so they can never disagree with
+// each other about which flags match.
+async function computeAutoCloseFlagMatches(data) {
+  const flags = data.flags || [];
+  const ticketNumbers = flags.map(f => f.id); // f.id IS the ticketNumber for flag objects
+  const numberToId = await fetchTicketIdsByNumbers(ticketNumbers);
+
+  const idToNumber = {};
+  Object.entries(numberToId).forEach(([num, id]) => { idToNumber[id] = num; });
+
+  const autoClosedIds = await fetchAutoClosedTicketIds(Object.values(numberToId));
+  const matchedTicketNumbers = new Set();
+  autoClosedIds.forEach(id => {
+    if (idToNumber[id]) matchedTicketNumbers.add(idToNumber[id]);
+  });
+
+  const matchedFlags = flags.filter(f => matchedTicketNumbers.has(f.id));
+  const unresolvedTicketNumbers = ticketNumbers.filter(tn => !(tn in numberToId));
+
+  return { matchedFlags, unresolvedTicketNumbers };
 }
 
 // ── Analyze a batch of tickets with Claude ────────────────────────────────────
@@ -1079,12 +1134,75 @@ router.post('/analyze-tech', async (req, res, next) => {
   }
 });
 
-router.post('/admin/clear-flags', (req, res) => {
+router.post('/admin/clear-flags', requireOwner, (req, res) => {
   const data = loadData();
   const count = (data.flags || []).length;
   data.flags = [];
   saveData(data);
   res.json({ ok: true, clearedFlags: count });
+});
+
+// One-time cleanup for flags generated before the auto-close-exclusion fix.
+// PREVIEW makes no changes — read this response before ever calling apply.
+router.get('/admin/auto-close-flag-cleanup-preview', requireOwner, async (req, res, next) => {
+  try {
+    const data = loadData();
+    const { matchedFlags, unresolvedTicketNumbers } = await computeAutoCloseFlagMatches(data);
+    res.json({
+      totalFlags: (data.flags || []).length,
+      matchCount: matchedFlags.length,
+      matches: matchedFlags.map(f => ({
+        ticketNumber: f.id,
+        company: f.company,
+        severity: f.sev,
+        flagType: f.flagType,
+        summary: f.summary,
+        ticketUrl: f.ticketUrl
+      })),
+      // Ticket numbers that couldn't be resolved to an internal AutoTask ID at
+      // all (e.g. a deleted ticket) — not touched by apply, worth a manual look.
+      unresolvedTicketNumbers
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// APPLY — actually removes the matched flags and updates their reviewed
+// metadata. Requires { "confirm": true } in the body so this can't be
+// triggered by an accidental request. Run the preview route first.
+router.post('/admin/auto-close-flag-cleanup-apply', requireOwner, async (req, res, next) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: 'Pass { "confirm": true } in the request body to apply this cleanup. Run the preview route first.' });
+  }
+  try {
+    const data = loadData();
+    const { matchedFlags } = await computeAutoCloseFlagMatches(data);
+    const matchedNumbers = new Set(matchedFlags.map(f => f.id));
+
+    data.flags = (data.flags || []).filter(f => !matchedNumbers.has(f.id));
+
+    matchedNumbers.forEach(ticketNumber => {
+      if (data.reviewed[ticketNumber]) {
+        data.reviewed[ticketNumber] = {
+          ...data.reviewed[ticketNumber],
+          hasIssues: false,
+          flagType: null,
+          autoClosedNoResponse: true
+        };
+      }
+    });
+
+    saveData(data);
+    res.json({
+      ok: true,
+      removedCount: matchedFlags.length,
+      removedTicketNumbers: [...matchedNumbers],
+      remainingFlags: data.flags.length
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // Admin route — clear reviewed entries from a specific date forward (to fix
