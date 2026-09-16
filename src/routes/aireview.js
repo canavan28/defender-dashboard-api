@@ -276,6 +276,9 @@ async function fetchTicketIdsByNumbers(ticketNumbers) {
       console.warn('[AIReview] Could not resolve a chunk of ticket numbers to IDs:', err.message);
     }
     if (i + CHUNK < cleanNumbers.length) await new Promise(r => setTimeout(r, 300));
+  }
+  return map;
+}
 
 // ── One-time cleanup: find which existing flags match the auto-close pattern ──
 // Shared by the preview and apply routes so they can never disagree with
