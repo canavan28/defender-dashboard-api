@@ -255,9 +255,10 @@ function baseReviewMetadata(t, now) {
 // field (a string field) — same chunk/pagination pattern as elsewhere in this file.
 async function fetchTicketIdsByNumbers(ticketNumbers) {
   const map = {};
+  const cleanNumbers = ticketNumbers.filter(Boolean); // strip null/undefined — a single bad value in AutoTask's 'in' filter fails the ENTIRE chunk, not just that entry
   const CHUNK = 500;
-  for (let i = 0; i < ticketNumbers.length; i += CHUNK) {
-    const chunk = ticketNumbers.slice(i, i + CHUNK);
+  for (let i = 0; i < cleanNumbers.length; i += CHUNK) {
+    const chunk = cleanNumbers.slice(i, i + CHUNK);
     const filter = [{ field: 'ticketNumber', op: 'in', value: chunk }];
     try {
       let nextPageUrl = null;
@@ -274,17 +275,15 @@ async function fetchTicketIdsByNumbers(ticketNumbers) {
     } catch (err) {
       console.warn('[AIReview] Could not resolve a chunk of ticket numbers to IDs:', err.message);
     }
-    if (i + CHUNK < ticketNumbers.length) await new Promise(r => setTimeout(r, 300));
-  }
-  return map;
-}
+    if (i + CHUNK < cleanNumbers.length) await new Promise(r => setTimeout(r, 300));
 
 // ── One-time cleanup: find which existing flags match the auto-close pattern ──
 // Shared by the preview and apply routes so they can never disagree with
 // each other about which flags match.
 async function computeAutoCloseFlagMatches(data) {
   const flags = data.flags || [];
-  const ticketNumbers = flags.map(f => f.id); // f.id IS the ticketNumber for flag objects
+  const flagsMissingTicketNumber = flags.filter(f => !f.id).length; // pre-existing bad data — a flag with no traceable ticket number at all, separate from a lookup failure
+  const ticketNumbers = flags.map(f => f.id).filter(Boolean);
   const numberToId = await fetchTicketIdsByNumbers(ticketNumbers);
 
   const idToNumber = {};
@@ -299,7 +298,7 @@ async function computeAutoCloseFlagMatches(data) {
   const matchedFlags = flags.filter(f => matchedTicketNumbers.has(f.id));
   const unresolvedTicketNumbers = ticketNumbers.filter(tn => !(tn in numberToId));
 
-  return { matchedFlags, unresolvedTicketNumbers };
+  return { matchedFlags, unresolvedTicketNumbers, flagsMissingTicketNumber };
 }
 
 // ── Analyze a batch of tickets with Claude ────────────────────────────────────
@@ -1147,7 +1146,7 @@ router.post('/admin/clear-flags', requireOwner, (req, res) => {
 router.get('/admin/auto-close-flag-cleanup-preview', requireOwner, async (req, res, next) => {
   try {
     const data = loadData();
-    const { matchedFlags, unresolvedTicketNumbers } = await computeAutoCloseFlagMatches(data);
+    const { matchedFlags, unresolvedTicketNumbers, flagsMissingTicketNumber } = await computeAutoCloseFlagMatches(data);
     res.json({
       totalFlags: (data.flags || []).length,
       matchCount: matchedFlags.length,
@@ -1159,6 +1158,9 @@ router.get('/admin/auto-close-flag-cleanup-preview', requireOwner, async (req, r
         summary: f.summary,
         ticketUrl: f.ticketUrl
       })),
+      // Flags with no ticketNumber at all — pre-existing bad data, not
+      // something this cleanup can resolve. Worth a separate manual look.
+      flagsMissingTicketNumber,
       // Ticket numbers that couldn't be resolved to an internal AutoTask ID at
       // all (e.g. a deleted ticket) — not touched by apply, worth a manual look.
       unresolvedTicketNumbers
