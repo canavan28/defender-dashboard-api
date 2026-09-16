@@ -332,4 +332,56 @@ router.get('/resource-search', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------
+// Auto-close-on-no-response investigation (AI Review false positives) —
+// added this session. AI Review is flagging tickets like T20260727.0017
+// as "customer-health" issues (frustration, unresolved) when the real
+// story is: workflow rule "Waiting on Customer - Day 5" auto-closed the
+// ticket after 5 business days of no customer response, following 3
+// manual outreach attempts + 2 automatic ones. There is no clean status
+// or UDF for this — confirmed by Matt directly, not guessed — the only
+// signal is an internal note titled "Auto Closing ticket. No response
+// after 5 business days." This route pulls the raw ticket plus its raw
+// notes so we can see the REAL entity/field names (note entity name,
+// which field holds the note title vs body, which field marks
+// "Internal Only") before writing any matching logic against them.
+// ---------------------------------------------------------------------
+
+// GET /api/diagnostic/ticket-notes-raw?ticketNumber=T20260727.0017
+router.get('/ticket-notes-raw', async (req, res) => {
+  const ticketNumber = req.query.ticketNumber;
+  if (!ticketNumber) {
+    return res.status(400).json({ error: 'Pass ?ticketNumber=TXXXXXXXX.XXXX in the URL' });
+  }
+  try {
+    const ticketRes = await autotaskClient.post('/Tickets/query', {
+      filter: [{ field: 'ticketNumber', op: 'eq', value: ticketNumber }]
+    });
+    const ticket = ticketRes.data.items?.[0];
+    if (!ticket) {
+      return res.status(404).json({ error: `No ticket found with ticketNumber ${ticketNumber}` });
+    }
+
+    let notes = null;
+    let notesError = null;
+    try {
+      const notesRes = await autotaskClient.post('/TicketNotes/query', {
+        filter: [{ field: 'ticketID', op: 'eq', value: ticket.id }]
+      });
+      notes = notesRes.data.items || [];
+    } catch (err) {
+      notesError = { error: err.message, body: err.response?.data };
+    }
+
+    res.json({
+      ticketNumber,
+      ticket,
+      notes,
+      notesError
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;

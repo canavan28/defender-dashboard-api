@@ -12,6 +12,8 @@ const AUTOTASK_ZONE = (process.env.AUTOTASK_ZONE_URL || '').replace('/ATServices
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
 const EXCLUDE_CATEGORIES = new Set([104]); // 104 = LUV Credit Card Requests
 const FLAG_WINDOW_DAYS = 60; // Only flag tickets created within this many days
+const TICKET_LOOKBACK_DAYS = 60; // How far back to pull tickets for review at all (shrunk from 6 months to cut AI Review runtime)
+const LOW_PRIORITY = 4; // AutoTask priority 4 = Low — excluded from AI Review entirely
 const CLAUDE_MODEL = 'claude-opus-4-6';
 
 const TECH_TIERS = {
@@ -131,8 +133,8 @@ function ticketUrl(ticketNumber) {
 
 // ── Fetch all tickets for review using pagination ─────────────────────────────
 async function fetchAllTicketsForReview() {
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  const lookbackCutoff = new Date();
+  lookbackCutoff.setDate(lookbackCutoff.getDate() - TICKET_LOOKBACK_DAYS);
 
   const queueFilter = {
     op: 'or',
@@ -141,7 +143,8 @@ async function fetchAllTicketsForReview() {
 
   const filter = [
     queueFilter,
-    { field: 'createDate', op: 'gte', value: sixMonthsAgo.toISOString() }
+    { field: 'createDate', op: 'gte', value: lookbackCutoff.toISOString() },
+    { field: 'priority', op: 'noteq', value: LOW_PRIORITY }
   ];
 
   let allTickets = [];
@@ -161,7 +164,7 @@ async function fetchAllTicketsForReview() {
   // Filter out excluded categories (e.g. LUV Credit Card Requests = 104)
   const before = allTickets.length;
   allTickets = allTickets.filter(t => !EXCLUDE_CATEGORIES.has(t.ticketCategory));
-  console.log(`[AIReview] Fetched ${before} tickets, ${allTickets.length} after category filter`);
+  console.log(`[AIReview] Fetched ${before} tickets (last ${TICKET_LOOKBACK_DAYS} days, Low priority excluded), ${allTickets.length} after category filter`);
   return allTickets;
 }
 
