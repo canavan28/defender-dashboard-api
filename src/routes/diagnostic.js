@@ -384,4 +384,37 @@ router.get('/ticket-notes-raw', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/auto-close-notes-test?ticketIds=61136,61137,61200
+// Tests whether AutoTask's 'in' operator (on ticketID) and 'contains'
+// operator (on title) can be combined in a single TicketNotes query — not
+// yet confirmed anywhere in this project. This needs to work in bulk
+// (hundreds of ticket IDs per call) for the AI Review auto-close-exclusion
+// fix to be efficient rather than one lookup per ticket. Pass a handful of
+// known ticket IDs, including at least one confirmed to have an
+// "Auto Closing ticket..." note (e.g. 61136, from T20260727.0017) and one
+// that does NOT, to confirm both true and false cases come back correctly.
+router.get('/auto-close-notes-test', async (req, res) => {
+  const idsParam = req.query.ticketIds;
+  if (!idsParam) {
+    return res.status(400).json({ error: 'Pass ?ticketIds=61136,61137,... in the URL' });
+  }
+  const ticketIds = idsParam.split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean);
+  try {
+    const response = await autotaskClient.post('/TicketNotes/query', {
+      filter: [
+        { field: 'ticketID', op: 'in', value: ticketIds },
+        { field: 'title', op: 'contains', value: 'Auto Closing ticket' }
+      ]
+    });
+    res.json({
+      queriedTicketIds: ticketIds,
+      matchedTicketIds: [...new Set((response.data.items || []).map(n => n.ticketID))],
+      items: response.data.items || [],
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
