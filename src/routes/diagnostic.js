@@ -417,4 +417,31 @@ router.get('/auto-close-notes-test', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/ticket-numbers-to-ids-test?ticketNumbers=T20260727.0017,T20260916.0035
+// Tests whether AutoTask's 'in' operator works on the ticketNumber field
+// (a string field) — only confirmed so far on numeric ID fields elsewhere
+// in this project (Companies.id, TicketNotes.ticketID). Needed for the AI
+// Review flag-cleanup admin route, which only has ticketNumbers stored in
+// data.flags and needs to bulk-resolve them to internal ticket IDs before
+// it can check TicketNotes for the auto-close pattern.
+router.get('/ticket-numbers-to-ids-test', async (req, res) => {
+  const numbersParam = req.query.ticketNumbers;
+  if (!numbersParam) {
+    return res.status(400).json({ error: 'Pass ?ticketNumbers=T20260727.0017,T20260916.0035 in the URL' });
+  }
+  const ticketNumbers = numbersParam.split(',').map(s => s.trim()).filter(Boolean);
+  try {
+    const response = await autotaskClient.post('/Tickets/query', {
+      filter: [{ field: 'ticketNumber', op: 'in', value: ticketNumbers }]
+    });
+    res.json({
+      queriedTicketNumbers: ticketNumbers,
+      matched: (response.data.items || []).map(t => ({ ticketNumber: t.ticketNumber, id: t.id })),
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
