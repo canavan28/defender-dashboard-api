@@ -444,4 +444,37 @@ router.get('/ticket-numbers-to-ids-test', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/bulk-notes-test?ticketIds=61106,61136
+// Tests fetching ALL notes for a bulk set of ticket IDs (ticketID 'in',
+// with NO other filter condition) — different from auto-close-notes-test,
+// which combines 'in' with a 'contains' filter on title. Needed for the
+// RMM-auto-resolved exclusion fix, which has to inspect every note on a
+// ticket (checking creatorResourceID on each) rather than match a single
+// known phrase.
+router.get('/bulk-notes-test', async (req, res) => {
+  const idsParam = req.query.ticketIds;
+  if (!idsParam) {
+    return res.status(400).json({ error: 'Pass ?ticketIds=61106,61136 in the URL' });
+  }
+  const ticketIds = idsParam.split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean);
+  try {
+    const response = await autotaskClient.post('/TicketNotes/query', {
+      filter: [{ field: 'ticketID', op: 'in', value: ticketIds }]
+    });
+    const byTicket = {};
+    (response.data.items || []).forEach(n => {
+      if (!byTicket[n.ticketID]) byTicket[n.ticketID] = [];
+      byTicket[n.ticketID].push({ creatorResourceID: n.creatorResourceID, title: n.title });
+    });
+    res.json({
+      queriedTicketIds: ticketIds,
+      noteCountByTicket: Object.fromEntries(Object.entries(byTicket).map(([id, notes]) => [id, notes.length])),
+      notesByTicket: byTicket,
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
