@@ -477,4 +477,43 @@ router.get('/bulk-notes-test', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/ticket-time-entries-raw?ticketNumber=T20260625.0035
+// Pulls raw TimeEntries for one ticket — needed because the actual
+// resolution write-up techs enter (hours, billing code, root cause,
+// actions taken, resolution) lives here, NOT in TicketNotes. AI Review's
+// analyzeBatch() currently never fetches this at all, which is a likely
+// major contributor to over-flagging: Claude only ever sees the original
+// alert description, never what the tech actually found/did. This route
+// confirms real field names before that gets wired in.
+router.get('/ticket-time-entries-raw', async (req, res) => {
+  const ticketNumber = req.query.ticketNumber;
+  if (!ticketNumber) {
+    return res.status(400).json({ error: 'Pass ?ticketNumber=TXXXXXXXX.XXXX in the URL' });
+  }
+  try {
+    const ticketRes = await autotaskClient.post('/Tickets/query', {
+      filter: [{ field: 'ticketNumber', op: 'eq', value: ticketNumber }]
+    });
+    const ticket = ticketRes.data.items?.[0];
+    if (!ticket) {
+      return res.status(404).json({ error: `No ticket found with ticketNumber ${ticketNumber}` });
+    }
+
+    let timeEntries = null;
+    let timeEntriesError = null;
+    try {
+      const teRes = await autotaskClient.post('/TimeEntries/query', {
+        filter: [{ field: 'ticketID', op: 'eq', value: ticket.id }]
+      });
+      timeEntries = teRes.data.items || [];
+    } catch (err) {
+      timeEntriesError = { error: err.message, body: err.response?.data };
+    }
+
+    res.json({ ticketNumber, ticketId: ticket.id, timeEntries, timeEntriesError });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
