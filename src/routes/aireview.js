@@ -16,6 +16,8 @@ const FLAG_WINDOW_DAYS = 60; // Only flag tickets created within this many days
 const TICKET_LOOKBACK_DAYS = 60; // How far back to pull tickets for review at all (shrunk from 6 months to cut AI Review runtime)
 const LOW_PRIORITY = 4; // AutoTask priority 4 = Low — excluded from AI Review entirely
 const AUTO_CLOSE_NOTE_TITLE_MATCH = 'Auto Closing ticket'; // Matches the "Auto Closing ticket. No response after X business days" note created by AutoTask's "Waiting on Customer" workflow rules. Confirmed via diagnostic testing (ticketID 'in' + title 'contains' on TicketNotes) — see /api/diagnostic/auto-close-notes-test. Per Matt: a ticket with this note means the customer never responded past the initial ticket-open message, and should ALWAYS be excluded from AI Review regardless of ticket content — this is not a real signal, and repeated instances are not a signal either.
+const RMM_RESOLVED_STATUS = 20; // AutoTask ticket status "RMM Resolved" — confirmed via /api/diagnostic/ticket-fields
+const SYSTEM_RESOURCE_ID = 4; // "Autotask Administrator" — the system account that authors workflow-rule notes. Confirmed via two real tickets (T20260725.0003, T20260916.0035/0023) that every automated workflow-rule note has creatorResourceID 4. A note with any OTHER creatorResourceID (including null, which is a customer reply via chat) means a real person or the chat-bot was involved.
 const CLAUDE_MODEL = 'claude-opus-4-6';
 
 const TECH_TIERS = {
@@ -227,6 +229,52 @@ async function fetchAutoClosedTicketIds(ticketIds) {
     if (i + CHUNK < ticketIds.length) await new Promise(r => setTimeout(r, 300));
   }
   return excludedIds;
+}
+
+// ── Find RMM-auto-resolved tickets with no human/customer involvement ────────
+// Per Matt: RMM alerts sometimes open a ticket, then the RMM tool itself
+// resolves the underlying issue and closes the ticket automatically, with no
+// person ever touching it. Confirmed via diagnostic testing (T20260725.0003):
+// these tickets have status RMM_RESOLVED and every note authored by the
+// SYSTEM_RESOURCE_ID system account. This checks ALL notes on a ticket (no
+// title filter, unlike fetchAutoClosedTicketIds) — returns the set of ticket
+// IDs that have at least one note from someone/something other than the
+// system account, and separately the set of ticket IDs a chunk failure
+// prevented from being checked at all (those must NOT be assumed excluded —
+// only tickets we could positively confirm have zero non-system notes should
+// ever be skipped from Claude review).
+async function fetchTicketNoteCheckResults(ticketIds) {
+  const idsWithNonSystemNotes = new Set();
+  const failedIds = new Set();
+  if (!ticketIds.length) return { idsWithNonSystemNotes, failedIds };
+
+  const CHUNK = 500;
+  for (let i = 0; i < ticketIds.length; i += CHUNK) {
+    const chunk = ticketIds.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketID', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/TicketNotes/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(n => {
+        if (n.creatorResourceID !== SYSTEM_RESOURCE_ID) idsWithNonSystemNotes.add(n.ticketID);
+      });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(n => {
+          if (n.creatorResourceID !== SYSTEM_RESOURCE_ID) idsWithNonSystemNotes.add(n.ticketID);
+        });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not check notes for a chunk of RMM-resolved tickets — leaving them in scope for Claude review rather than risking a wrong exclusion:', err.message);
+      chunk.forEach(id => failedIds.add(id));
+    }
+    if (i + CHUNK < ticketIds.length) await new Promise(r => setTimeout(r, 300));
+  }
+  return { idsWithNonSystemNotes, failedIds };
 }
 
 // ── Shared reviewed-metadata fields (used for both AI-analyzed and auto-closed tickets) ──
@@ -612,16 +660,40 @@ async function runReviewJob() {
     data.reviewed = reviewed;
     saveData(data);
 
+    // Find RMM-auto-resolved tickets with no human/customer involvement at
+    // all (see fetchTicketNoteCheckResults) and pull them out too. Only
+    // tickets we could POSITIVELY confirm have zero non-system notes get
+    // excluded — a chunk lookup failure leaves those tickets in scope rather
+    // than risking a wrong exclusion.
+    runState = { ...runState, phase: 'Checking RMM-resolved tickets for human involvement', progress: 9.5 };
+    const rmmCandidates = ticketsToAnalyze.filter(t => t.status === RMM_RESOLVED_STATUS);
+    const { idsWithNonSystemNotes, failedIds } = await fetchTicketNoteCheckResults(rmmCandidates.map(t => t.id));
+    const rmmExcludedTickets = rmmCandidates.filter(t => !idsWithNonSystemNotes.has(t.id) && !failedIds.has(t.id));
+    const rmmExcludedIds = new Set(rmmExcludedTickets.map(t => t.id));
+    const ticketsForClaude = ticketsToAnalyze.filter(t => !rmmExcludedIds.has(t.id));
+    console.log(`[AIReview] ${rmmExcludedTickets.length} RMM-resolved tickets with no human involvement — excluded from AI analysis, ${ticketsForClaude.length} remaining to analyze`);
+
+    rmmExcludedTickets.forEach(t => {
+      reviewed[t.ticketNumber] = {
+        ...baseReviewMetadata(t, preNow),
+        hasIssues: false,
+        flagType: null,
+        rmmResolvedNoHumanNotes: true
+      };
+    });
+    data.reviewed = reviewed;
+    saveData(data);
+
     // Fetch company names (only needed for tickets actually going to Claude)
     runState = { ...runState, phase: 'Fetching company names', progress: 10 };
-    const companyIds = [...new Set(ticketsToAnalyze.map(t => t.companyID).filter(Boolean))];
+    const companyIds = [...new Set(ticketsForClaude.map(t => t.companyID).filter(Boolean))];
     const companyMap = await fetchCompanyNames(companyIds);
 
     // Process in batches of 25
     const BATCH_SIZE = 25;
     const batches = [];
-    for (let i = 0; i < ticketsToAnalyze.length; i += BATCH_SIZE) {
-      batches.push(ticketsToAnalyze.slice(i, i + BATCH_SIZE));
+    for (let i = 0; i < ticketsForClaude.length; i += BATCH_SIZE) {
+      batches.push(ticketsForClaude.slice(i, i + BATCH_SIZE));
     }
 
     console.log(`[AIReview] Processing ${batches.length} batches of up to ${BATCH_SIZE} tickets...`);
@@ -753,6 +825,7 @@ async function runReviewJob() {
       lastRunAt: now,
       lastRunReviewed: toReview.length - totalSkippedTickets,
       lastRunAutoClosedExcluded: autoClosedTickets.length,
+      lastRunRmmResolvedExcluded: rmmExcludedTickets.length,
       lastRunSkipped: totalSkippedTickets,
       lastRunFlagged: allNewFlags.length,
       totalReviewed: Object.keys(finalData.reviewed).length,
