@@ -548,4 +548,24 @@ router.get('/bulk-time-entries-test', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/resource-lookup?id=29682925
+// Fetches a single Resource record by internal ID directly — needed to
+// confirm whether a given ID is a real person or a system/bot integration
+// account (e.g. resource 29682925, which note text attributes to "Thread's
+// Magic AI") before excluding its notes from AI Review's tech-notes fetch.
+router.get('/resource-lookup', async (req, res) => {
+  const id = parseInt(req.query.id, 10);
+  if (!id) {
+    return res.status(400).json({ error: 'Pass ?id=XXXXXXXX in the URL' });
+  }
+  try {
+    const response = await autotaskClient.post('/Resources/query', {
+      filter: [{ field: 'id', op: 'eq', value: id }]
+    });
+    res.json({ id, resource: response.data.items?.[0] || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
