@@ -17,8 +17,35 @@ const TICKET_LOOKBACK_DAYS = 60; // How far back to pull tickets for review at a
 const LOW_PRIORITY = 4; // AutoTask priority 4 = Low — excluded from AI Review entirely
 const AUTO_CLOSE_NOTE_TITLE_MATCH = 'Auto Closing ticket'; // Matches the "Auto Closing ticket. No response after X business days" note created by AutoTask's "Waiting on Customer" workflow rules. Confirmed via diagnostic testing (ticketID 'in' + title 'contains' on TicketNotes) — see /api/diagnostic/auto-close-notes-test. Per Matt: a ticket with this note means the customer never responded past the initial ticket-open message, and should ALWAYS be excluded from AI Review regardless of ticket content — this is not a real signal, and repeated instances are not a signal either.
 const RMM_RESOLVED_STATUS = 20; // AutoTask ticket status "RMM Resolved" — confirmed via /api/diagnostic/ticket-fields
+const TECH_NOTES_CHAR_CAP = 2000; // Combined TicketNotes + TimeEntries write-up length cap per ticket. Truncation is tracked and logged (see fetchTicketContextNotes) so Matt can see how often real tech write-ups exceed this.
 const SYSTEM_RESOURCE_ID = 4; // "Autotask Administrator" — the system account that authors workflow-rule notes. Confirmed via two real tickets (T20260725.0003, T20260916.0035/0023) that every automated workflow-rule note has creatorResourceID 4. A note with any OTHER creatorResourceID (including null, which is a customer reply via chat) means a real person or the chat-bot was involved.
 const CLAUDE_MODEL = 'claude-opus-4-6';
+
+// ── Status / issue type label maps ────────────────────────────────────────────
+// Confirmed via /api/diagnostic/ticket-fields. AI Review previously sent Claude
+// raw numeric codes (e.g. "status": 5) with no way to know what they meant —
+// a real contributor to over-flagging, since the model had almost nothing
+// solid to anchor on besides ticket title/description wording. Only active,
+// currently-relevant values are included; an unmapped code falls back to
+// `Status ${code}` / `IssueType ${code}` in the code below rather than throwing.
+const STATUS_LABELS = {
+  1: 'New', 5: 'Complete', 7: 'Waiting Customer', 8: 'In Progress',
+  9: 'Waiting Materials', 10: 'Assigned', 12: 'Waiting Vendor',
+  17: 'On Hold', 19: 'Customer Note Added', 20: 'RMM Resolved',
+  21: 'Co-Managed', 22: 'Scheduled - Phone Call', 23: 'Re-Opened',
+  24: 'Waiting on Engineer', 26: '1st Attempt', 27: '2nd Attempt',
+  30: 'Escalated', 35: 'Procurement', 36: 'Approval Pending',
+  37: 'Not Approved', 39: 'Hot Swap', 40: 'In Transit',
+  41: 'Scheduled - Onsite', 42: 'Scheduled - Comp Build', 43: 'In Prog - Comp Build'
+};
+const ISSUE_TYPE_LABELS = {
+  6: 'InfoTank Services', 7: 'Server', 10: 'Computer', 11: 'Network',
+  13: 'Maintenance', 16: 'Other', 17: 'Quote', 18: 'RMM Monitoring',
+  19: 'Web Development', 20: 'Email', 21: 'User Management',
+  22: 'Net User Change', 23: 'New Device Setup', 24: 'Mobile Device Management',
+  26: 'Leased Item Install', 27: 'HSCC Daily Onsite', 28: 'Microsoft',
+  29: 'Software', 30: 'Printing/Scanning'
+};
 
 const TECH_TIERS = {
   29682924: { name: 'Carlos Agundez', tier: 1 },
@@ -32,19 +59,27 @@ const TECH_TIERS = {
 // ── Default prompts ───────────────────────────────────────────────────────────
 const DEFAULT_TICKET_REVIEW_PROMPT = `You are reviewing IT support tickets for an MSP looking for issues needing executive attention.
 
-WHAT TO LOOK FOR:
-1. customer-health: Customer frustration, repeat issues, long resolution, multiple follow-ups
-2. cross-customer: Same issue type across multiple users at the same company
-3. escalation: Started with Tier 1 but required Tier 2 or Tier 3
-4. tech-performance: Unusually long resolution, misdiagnosis, confusing back-and-forth
-5. documentation: No notes, no resolution description
-6. reopen: Ticket reopened after closure
+HOW TO READ EACH TICKET:
+- "title" and "description" are the ORIGINAL alert or request as it came in. They describe the starting problem, not necessarily the outcome — a title like "threat not mitigated" is just what an automated alert was called when it first fired, and does NOT mean the threat is still unmitigated now.
+- "status" is the ticket's CURRENT state (e.g. "Complete", "RMM Resolved", "In Progress", "Waiting Customer"). A ticket with a completed/resolved status has been closed out — do not treat it as an ongoing or unresolved issue based on title/description wording alone.
+- "techNotes" is what a technician actually documented — either a manual note or a time-entry write-up. THIS is the ground-truth account of what happened and what the resolution was. When techNotes documents a real investigation, root cause, and resolution (even if brief), that is evidence the ticket was handled properly, regardless of how alarming the original title sounds.
+- If techNotes says "No human notes or time entry write-ups logged on this ticket," that means nobody documented what they did — for a completed ticket, that absence of documentation is itself a potential "documentation" flag, but it is NOT evidence the underlying problem is still unresolved.
+
+WHAT TO LOOK FOR (only flag when techNotes and status genuinely support it, not just because the title sounds severe):
+1. customer-health: Customer frustration, repeat issues, long resolution, multiple follow-ups — evidenced in techNotes or the ticket's actual back-and-forth, not just an old open date
+2. cross-customer: Same issue type across multiple users at the same company, where the pattern itself (not just volume) suggests something unaddressed
+3. escalation: Started with Tier 1 but required Tier 2 or Tier 3, and the escalation itself indicates a real problem (not simply that a specialist happened to close it)
+4. tech-performance: Unusually long resolution, misdiagnosis, or confusing back-and-forth — evidenced by what techNotes actually shows happened, not just elapsed time
+5. documentation: A completed ticket with no techNotes at all — genuinely undocumented work, not a ticket that's simply still open and in progress
+6. reopen: Ticket reopened after closure, where techNotes or status history shows the original fix didn't hold
 
 SEVERITY:
-- critical: Immediate executive attention required
+- critical: Immediate executive attention required — a genuinely urgent, unresolved, or badly-handled situation confirmed by techNotes/status, not just alarming-sounding original alert text
 - high: Review this week
 - medium: Review when time allows
 - low: Informational
+
+Default to NOT flagging a ticket. A completed ticket with a documented, reasonable resolution in techNotes — even for a scary-sounding original alert (a security threat, a critical server error) — is normal, successful MSP work and should not be flagged just because the topic sounds serious.
 
 TICKETS:
 {{TICKETS}}
@@ -277,6 +312,108 @@ async function fetchTicketNoteCheckResults(ticketIds) {
   return { idsWithNonSystemNotes, failedIds };
 }
 
+// ── Fetch what techs actually documented, per ticket ──────────────────────────
+// This is the core fix for over-flagging: AI Review previously never sent
+// Claude anything beyond the ORIGINAL alert description and title — never
+// what a tech actually found or did. Per Matt, techs record this in two
+// different places depending on how they closed the ticket:
+//   1. TicketNotes — human-authored notes (e.g. a "Reason for Completion"
+//      note when a ticket is closed without logging time). Same
+//      creatorResourceID !== SYSTEM_RESOURCE_ID filter as the RMM-resolved fix.
+//   2. TimeEntries.summaryNotes — the richer write-up when a tech logs time
+//      against the ticket (confirmed via T20260625.0035's SentinelOne example).
+// Both are fetched and combined per ticket; a ticket with neither gets an
+// explicit "no documentation" marker rather than an empty string, so Claude
+// can distinguish "nothing happened" from "something happened, undocumented."
+async function fetchTicketContextNotes(ticketIds) {
+  const contextByTicket = {}; // ticketId -> { humanNotes: [...], timeEntryNotes: [...] }
+  ticketIds.forEach(id => { contextByTicket[id] = { humanNotes: [], timeEntryNotes: [] }; });
+  if (!ticketIds.length) return {};
+
+  const CHUNK = 500;
+
+  // Human-authored TicketNotes
+  for (let i = 0; i < ticketIds.length; i += CHUNK) {
+    const chunk = ticketIds.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketID', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/TicketNotes/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(n => {
+        if (n.creatorResourceID !== SYSTEM_RESOURCE_ID && contextByTicket[n.ticketID] && n.description) {
+          contextByTicket[n.ticketID].humanNotes.push(n.description);
+        }
+      });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(n => {
+          if (n.creatorResourceID !== SYSTEM_RESOURCE_ID && contextByTicket[n.ticketID] && n.description) {
+            contextByTicket[n.ticketID].humanNotes.push(n.description);
+          }
+        });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not fetch ticket notes for a chunk of tickets:', err.message);
+    }
+    if (i + CHUNK < ticketIds.length) await new Promise(r => setTimeout(r, 300));
+  }
+
+  // TimeEntries.summaryNotes
+  for (let i = 0; i < ticketIds.length; i += CHUNK) {
+    const chunk = ticketIds.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketID', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/TimeEntries/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(te => {
+        if (contextByTicket[te.ticketID] && te.summaryNotes) {
+          contextByTicket[te.ticketID].timeEntryNotes.push(te.summaryNotes);
+        }
+      });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(te => {
+          if (contextByTicket[te.ticketID] && te.summaryNotes) {
+            contextByTicket[te.ticketID].timeEntryNotes.push(te.summaryNotes);
+          }
+        });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not fetch time entries for a chunk of tickets:', err.message);
+    }
+    if (i + CHUNK < ticketIds.length) await new Promise(r => setTimeout(r, 300));
+  }
+
+  // Combine into one string per ticket, capped at TECH_NOTES_CHAR_CAP.
+  // Truncations are tracked (returned to the caller) and logged here so it's
+  // visible how often real tech write-ups exceed the cap.
+  const combined = {};
+  const truncatedTicketIds = [];
+  Object.entries(contextByTicket).forEach(([id, { humanNotes, timeEntryNotes }]) => {
+    const parts = [];
+    if (humanNotes.length) parts.push('TECH NOTES:\n' + humanNotes.join('\n---\n'));
+    if (timeEntryNotes.length) parts.push('TIME ENTRY WRITE-UPS:\n' + timeEntryNotes.join('\n---\n'));
+    let text = parts.length ? parts.join('\n\n') : 'No human notes or time entry write-ups logged on this ticket.';
+    if (text.length > TECH_NOTES_CHAR_CAP) {
+      text = text.substring(0, TECH_NOTES_CHAR_CAP) + '... [truncated]';
+      truncatedTicketIds.push(Number(id));
+    }
+    combined[id] = text;
+  });
+
+  if (truncatedTicketIds.length) {
+    console.warn(`[AIReview] Tech notes exceeded the ${TECH_NOTES_CHAR_CAP}-char cap and were truncated for ${truncatedTicketIds.length} ticket(s), internal ID(s): ${truncatedTicketIds.join(', ')}`);
+  }
+
+  return { contextMap: combined, truncatedTicketIds };
+}
+
 // ── Shared reviewed-metadata fields (used for both AI-analyzed and auto-closed tickets) ──
 function baseReviewMetadata(t, now) {
   const techIds = [t.assignedResourceID, t.completedByResourceID].filter(Boolean);
@@ -416,7 +553,7 @@ async function computeRmmResolvedFlagMatches(data) {
 }
 
 // ── Analyze a batch of tickets with Claude ────────────────────────────────────
-async function analyzeBatch(batch, companyMap, customPrompt) {
+async function analyzeBatch(batch, companyMap, customPrompt, ticketContextMap) {
   const ticketSummaries = batch.map(t => {
     const techIds = [t.assignedResourceID, t.completedByResourceID].filter(Boolean);
     const techInfo = techIds.map(id => {
@@ -438,12 +575,16 @@ async function analyzeBatch(batch, companyMap, customPrompt) {
       ticketNumber: t.ticketNumber,
       companyId: t.companyID,
       title: t.title || '',
-      status: t.status,
-      issueType: t.issueType,
+      status: STATUS_LABELS[t.status] || `Status ${t.status}`,
+      issueType: t.issueType ? (ISSUE_TYPE_LABELS[t.issueType] || `IssueType ${t.issueType}`) : null,
       openDays,
       techInvolved: techInfo,
       isEscalation,
-      description: scrubPII((t.description || '').substring(0, 400))
+      description: scrubPII((t.description || '').substring(0, 400)),
+      // What the tech actually documented — this is the current, ground-truth
+      // account of what happened, and should be weighted over the original
+      // alert's title/description wording (see prompt guidance below).
+      techNotes: scrubPII((ticketContextMap && ticketContextMap[t.id]) || 'No human notes or time entry write-ups logged on this ticket.')
     };
   });
 
@@ -752,6 +893,11 @@ async function runReviewJob() {
     const companyIds = [...new Set(ticketsForClaude.map(t => t.companyID).filter(Boolean))];
     const companyMap = await fetchCompanyNames(companyIds);
 
+    // Fetch what techs actually documented (TicketNotes + TimeEntries combined)
+    // — this is the core fix for over-flagging; see fetchTicketContextNotes.
+    runState = { ...runState, phase: 'Fetching tech notes and time entries', progress: 10.5 };
+    const { contextMap: ticketContextMap, truncatedTicketIds: techNotesTruncatedIds } = await fetchTicketContextNotes(ticketsForClaude.map(t => t.id));
+
     // Process in batches of 25
     const BATCH_SIZE = 25;
     const batches = [];
@@ -776,7 +922,7 @@ async function runReviewJob() {
       let batchSucceeded = false;
       while (retries < 3) {
         try {
-          aiFlags = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null);
+          aiFlags = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
           batchSucceeded = true;
           break;
         } catch (err) {
@@ -889,6 +1035,7 @@ async function runReviewJob() {
       lastRunReviewed: toReview.length - totalSkippedTickets,
       lastRunAutoClosedExcluded: autoClosedTickets.length,
       lastRunRmmResolvedExcluded: rmmExcludedTickets.length,
+      lastRunTechNotesTruncated: techNotesTruncatedIds.length,
       lastRunSkipped: totalSkippedTickets,
       lastRunFlagged: allNewFlags.length,
       totalReviewed: Object.keys(finalData.reviewed).length,
