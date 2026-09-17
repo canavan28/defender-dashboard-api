@@ -352,6 +352,69 @@ async function computeAutoCloseFlagMatches(data) {
   return { matchedFlags, unresolvedTicketNumbers, flagsMissingTicketNumber };
 }
 
+// ── One-time cleanup: bulk-resolve ticketNumber -> {id, status} ──────────────
+// Same pattern as fetchTicketIdsByNumbers, but also captures status, which the
+// RMM-resolved cleanup needs to know (fetchTicketIdsByNumbers only kept id,
+// so this is a separate function rather than changing that one and risking
+// breaking the auto-close cleanup that already depends on its exact shape).
+async function fetchTicketDetailsByNumbers(ticketNumbers) {
+  const map = {}; // ticketNumber -> { id, status }
+  const cleanNumbers = ticketNumbers.filter(Boolean);
+  const CHUNK = 500;
+  for (let i = 0; i < cleanNumbers.length; i += CHUNK) {
+    const chunk = cleanNumbers.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketNumber', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(t => { map[t.ticketNumber] = { id: t.id, status: t.status }; });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(t => { map[t.ticketNumber] = { id: t.id, status: t.status }; });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not resolve a chunk of ticket numbers to details:', err.message);
+    }
+    if (i + CHUNK < cleanNumbers.length) await new Promise(r => setTimeout(r, 300));
+  }
+  return map;
+}
+
+// ── One-time cleanup: find which existing flags match the RMM-resolved,
+// no-human-notes pattern. Same shared-by-preview-and-apply structure as
+// computeAutoCloseFlagMatches. A flag only ever gets removed if the ticket's
+// status is confirmed RMM_RESOLVED AND every note on it is confirmed
+// system-authored — anything unresolved or unchecked due to an API failure
+// is left alone, never assumed to match.
+async function computeRmmResolvedFlagMatches(data) {
+  const flags = data.flags || [];
+  const flagsMissingTicketNumber = flags.filter(f => !f.id).length;
+  const ticketNumbers = flags.map(f => f.id).filter(Boolean);
+  const ticketDetails = await fetchTicketDetailsByNumbers(ticketNumbers);
+
+  const rmmCandidateNumbers = ticketNumbers.filter(tn => ticketDetails[tn]?.status === RMM_RESOLVED_STATUS);
+  const rmmCandidateIds = rmmCandidateNumbers.map(tn => ticketDetails[tn].id);
+
+  const idToNumber = {};
+  rmmCandidateNumbers.forEach(tn => { idToNumber[ticketDetails[tn].id] = tn; });
+
+  const { idsWithNonSystemNotes, failedIds } = await fetchTicketNoteCheckResults(rmmCandidateIds);
+  const matchedTicketNumbers = new Set();
+  rmmCandidateIds.forEach(id => {
+    if (!idsWithNonSystemNotes.has(id) && !failedIds.has(id)) matchedTicketNumbers.add(idToNumber[id]);
+  });
+
+  const matchedFlags = flags.filter(f => matchedTicketNumbers.has(f.id));
+  const unresolvedTicketNumbers = ticketNumbers.filter(tn => !(tn in ticketDetails));
+  const failedNoteCheckTicketNumbers = rmmCandidateNumbers.filter(tn => failedIds.has(ticketDetails[tn].id));
+
+  return { matchedFlags, unresolvedTicketNumbers, flagsMissingTicketNumber, failedNoteCheckTicketNumbers };
+}
+
 // ── Analyze a batch of tickets with Claude ────────────────────────────────────
 async function analyzeBatch(batch, companyMap, customPrompt) {
   const ticketSummaries = batch.map(t => {
@@ -1267,6 +1330,71 @@ router.post('/admin/auto-close-flag-cleanup-apply', requireOwner, async (req, re
           hasIssues: false,
           flagType: null,
           autoClosedNoResponse: true
+        };
+      }
+    });
+
+    saveData(data);
+    res.json({
+      ok: true,
+      removedCount: matchedFlags.length,
+      removedTicketNumbers: [...matchedNumbers],
+      remainingFlags: data.flags.length
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// One-time cleanup for flags generated before the RMM-resolved exclusion fix.
+// PREVIEW makes no changes — read this response before ever calling apply.
+router.get('/admin/rmm-resolved-flag-cleanup-preview', requireOwner, async (req, res, next) => {
+  try {
+    const data = loadData();
+    const { matchedFlags, unresolvedTicketNumbers, flagsMissingTicketNumber, failedNoteCheckTicketNumbers } = await computeRmmResolvedFlagMatches(data);
+    res.json({
+      totalFlags: (data.flags || []).length,
+      matchCount: matchedFlags.length,
+      matches: matchedFlags.map(f => ({
+        ticketNumber: f.id,
+        company: f.company,
+        severity: f.sev,
+        flagType: f.flagType,
+        summary: f.summary,
+        ticketUrl: f.ticketUrl
+      })),
+      flagsMissingTicketNumber,
+      unresolvedTicketNumbers,
+      // RMM-resolved candidates whose note check failed (e.g. an AutoTask API
+      // error mid-chunk) — deliberately NOT removed by apply. Worth a look if
+      // this list is non-empty; a re-run of preview may resolve it.
+      failedNoteCheckTicketNumbers
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// APPLY — actually removes the matched flags and updates their reviewed
+// metadata. Requires { "confirm": true } in the body. Run the preview first.
+router.post('/admin/rmm-resolved-flag-cleanup-apply', requireOwner, async (req, res, next) => {
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ error: 'Pass { "confirm": true } in the request body to apply this cleanup. Run the preview route first.' });
+  }
+  try {
+    const data = loadData();
+    const { matchedFlags } = await computeRmmResolvedFlagMatches(data);
+    const matchedNumbers = new Set(matchedFlags.map(f => f.id));
+
+    data.flags = (data.flags || []).filter(f => !matchedNumbers.has(f.id));
+
+    matchedNumbers.forEach(ticketNumber => {
+      if (data.reviewed[ticketNumber]) {
+        data.reviewed[ticketNumber] = {
+          ...data.reviewed[ticketNumber],
+          hasIssues: false,
+          flagType: null,
+          rmmResolvedNoHumanNotes: true
         };
       }
     });
