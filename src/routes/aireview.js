@@ -494,6 +494,38 @@ async function computeAutoCloseFlagMatches(data) {
 // RMM-resolved cleanup needs to know (fetchTicketIdsByNumbers only kept id,
 // so this is a separate function rather than changing that one and risking
 // breaking the auto-close cleanup that already depends on its exact shape).
+// ── Test/dry-run helper: fetch FULL ticket records by ticketNumber ───────────
+// Different from fetchTicketDetailsByNumbers (id + status only) — the manual
+// test-batch route needs everything analyzeBatch() actually uses (createDate,
+// completedDate, assignedResourceID, etc.), same shape as what
+// fetchAllTicketsForReview returns for a real run.
+async function fetchFullTicketsByNumbers(ticketNumbers) {
+  const map = {};
+  const cleanNumbers = ticketNumbers.filter(Boolean);
+  const CHUNK = 500;
+  for (let i = 0; i < cleanNumbers.length; i += CHUNK) {
+    const chunk = cleanNumbers.slice(i, i + CHUNK);
+    const filter = [{ field: 'ticketNumber', op: 'in', value: chunk }];
+    try {
+      let nextPageUrl = null;
+      const firstResponse = await autotaskClient.post('/Tickets/query', { filter, maxRecords: 500 });
+      (firstResponse.data.items || []).forEach(t => { map[t.ticketNumber] = t; });
+      nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
+
+      while (nextPageUrl) {
+        await new Promise(r => setTimeout(r, 300));
+        const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
+        (response.data.items || []).forEach(t => { map[t.ticketNumber] = t; });
+        nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
+      }
+    } catch (err) {
+      console.warn('[AIReview] Could not fetch a chunk of full ticket records:', err.message);
+    }
+    if (i + CHUNK < cleanNumbers.length) await new Promise(r => setTimeout(r, 300));
+  }
+  return map;
+}
+
 async function fetchTicketDetailsByNumbers(ticketNumbers) {
   const map = {}; // ticketNumber -> { id, status }
   const cleanNumbers = ticketNumbers.filter(Boolean);
@@ -1610,6 +1642,63 @@ router.post('/prompts/reset', (req, res) => {
     ticketReview: DEFAULT_TICKET_REVIEW_PROMPT,
     trendAnalysis: DEFAULT_TREND_ANALYSIS_PROMPT
   });
+});
+
+// ── Manual dry-run test: run specific tickets through the real pipeline ──────
+// Owner-gated. Fetches full ticket data + tech notes/time entries + company
+// names exactly like a real run, calls analyzeBatch() with the SAME logic
+// real batches use, and returns the result — WITHOUT writing to
+// reviewed.json or data.flags. Lets Matt hand-pick known example tickets
+// (a rubber-stamp close, a genuinely-resolved security alert, a real
+// problem) and see the new prompt/data pipeline's actual output side by
+// side, cheaply and repeatably, rather than waiting for real unreviewed
+// tickets to accumulate.
+router.post('/admin/test-batch', requireOwner, async (req, res, next) => {
+  const ticketNumbers = req.body?.ticketNumbers;
+  if (!Array.isArray(ticketNumbers) || ticketNumbers.length === 0) {
+    return res.status(400).json({ error: 'Pass { "ticketNumbers": ["T20260101.0001", ...] } in the body' });
+  }
+  if (ticketNumbers.length > 25) {
+    return res.status(400).json({ error: 'Max 25 ticket numbers per test batch (matches the real batch size)' });
+  }
+
+  try {
+    const ticketMap = await fetchFullTicketsByNumbers(ticketNumbers);
+    const foundTickets = Object.values(ticketMap);
+    const unresolvedTicketNumbers = ticketNumbers.filter(tn => !ticketMap[tn]);
+
+    if (foundTickets.length === 0) {
+      return res.json({ requestedTicketNumbers: ticketNumbers, unresolvedTicketNumbers, inputSummary: [], aiFlags: [] });
+    }
+
+    const companyIds = [...new Set(foundTickets.map(t => t.companyID).filter(Boolean))];
+    const companyMap = await fetchCompanyNames(companyIds);
+
+    const { contextMap: ticketContextMap, truncatedTicketIds } = await fetchTicketContextNotes(foundTickets.map(t => t.id));
+
+    const data = loadData();
+    const aiFlags = await analyzeBatch(foundTickets, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
+
+    // Show exactly what was sent to Claude for each ticket, so the flags
+    // (or lack thereof) can be sanity-checked against real input.
+    const inputSummary = foundTickets.map(t => ({
+      ticketNumber: t.ticketNumber,
+      title: t.title,
+      status: STATUS_LABELS[t.status] || `Status ${t.status}`,
+      techNotesSent: ticketContextMap[t.id],
+      techNotesTruncated: truncatedTicketIds.includes(t.id)
+    }));
+
+    res.json({
+      requestedTicketNumbers: ticketNumbers,
+      unresolvedTicketNumbers,
+      inputSummary,
+      aiFlags
+    });
+  } catch (err) {
+    console.error('[AIReview TestBatch] Failed:', err.message);
+    next(err);
+  }
 });
 
 module.exports = router;
