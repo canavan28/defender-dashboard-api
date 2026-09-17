@@ -516,4 +516,36 @@ router.get('/ticket-time-entries-raw', async (req, res) => {
   }
 });
 
+// GET /api/diagnostic/bulk-time-entries-test?ticketIds=59680,61166,61106
+// Tests bulk-fetching TimeEntries via ticketID 'in' — a different entity
+// from TicketNotes, so this confirms the operator works here too before
+// wiring bulk time-entry fetching into AI Review's batch analysis. Include
+// a ticket known to have zero time entries (e.g. 61106, the RMM-resolved
+// example) to confirm the empty case behaves correctly too.
+router.get('/bulk-time-entries-test', async (req, res) => {
+  const idsParam = req.query.ticketIds;
+  if (!idsParam) {
+    return res.status(400).json({ error: 'Pass ?ticketIds=59680,61166,61106 in the URL' });
+  }
+  const ticketIds = idsParam.split(',').map(s => parseInt(s.trim(), 10)).filter(Boolean);
+  try {
+    const response = await autotaskClient.post('/TimeEntries/query', {
+      filter: [{ field: 'ticketID', op: 'in', value: ticketIds }]
+    });
+    const byTicket = {};
+    (response.data.items || []).forEach(te => {
+      if (!byTicket[te.ticketID]) byTicket[te.ticketID] = [];
+      byTicket[te.ticketID].push({ hoursWorked: te.hoursWorked, summaryNotes: te.summaryNotes, internalNotes: te.internalNotes });
+    });
+    res.json({
+      queriedTicketIds: ticketIds,
+      entryCountByTicket: Object.fromEntries(ticketIds.map(id => [id, (byTicket[id] || []).length])),
+      entriesByTicket: byTicket,
+      pageDetails: response.data.pageDetails
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, body: err.response?.data });
+  }
+});
+
 module.exports = router;
