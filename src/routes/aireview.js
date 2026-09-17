@@ -20,6 +20,19 @@ const RMM_RESOLVED_STATUS = 20; // AutoTask ticket status "RMM Resolved" — con
 const TECH_NOTES_CHAR_CAP = 2000; // Combined TicketNotes + TimeEntries write-up length cap per ticket. Truncation is tracked and logged (see fetchTicketContextNotes) so Matt can see how often real tech write-ups exceed this.
 const SYSTEM_RESOURCE_ID = 4; // "Autotask Administrator" — the system account that authors workflow-rule notes. Confirmed via two real tickets (T20260725.0003, T20260916.0035/0023) that every automated workflow-rule note has creatorResourceID 4. A note with any OTHER creatorResourceID (including null, which is a customer reply via chat) means a real person or the chat-bot was involved.
 const CLAUDE_MODEL = 'claude-opus-4-6';
+// Confirmed via Anthropic's published pricing (Sept 2026) for claude-opus-4-6
+// standard-rate requests (all AI Review calls are well under the 200K-token
+// long-context threshold, so this rate applies uniformly). If Anthropic
+// changes pricing or the model changes, this needs manual updating — it's
+// not fetched live.
+const CLAUDE_INPUT_COST_PER_MTOK = 5;
+const CLAUDE_OUTPUT_COST_PER_MTOK = 25;
+
+function estimateCostUSD(usage) {
+  if (!usage) return 0;
+  return (usage.input_tokens || 0) / 1e6 * CLAUDE_INPUT_COST_PER_MTOK
+       + (usage.output_tokens || 0) / 1e6 * CLAUDE_OUTPUT_COST_PER_MTOK;
+}
 
 // ── Status / issue type label maps ────────────────────────────────────────────
 // Confirmed via /api/diagnostic/ticket-fields. AI Review previously sent Claude
@@ -80,6 +93,11 @@ SEVERITY:
 - low: Informational
 
 Default to NOT flagging a ticket. A completed ticket with a documented, reasonable resolution in techNotes — even for a scary-sounding original alert (a security threat, a critical server error) — is normal, successful MSP work and should not be flagged just because the topic sounds serious.
+
+SAFETY NET FOR MONITORING ALERTS (issueType "RMM Monitoring"): most routine, cleanly-resolved monitoring alerts never reach you at all — they're filtered out before review. This rule is a backstop for anything that still gets through. Do NOT flag a closed "RMM Monitoring" ticket unless:
+1. The same alert type appears 2+ times for the same company in this batch, OR
+2. The ticket was open for more than 4 hours (openDays > 0.17)
+A single, quickly-resolved monitoring alert (antivirus, disk, connectivity, patch) is routine and not actionable on its own.
 
 TICKETS:
 {{TICKETS}}
@@ -657,17 +675,21 @@ async function analyzeBatch(batch, companyMap, customPrompt, ticketContextMap) {
     throw err; // re-throw so retry logic handles it
   }
 
+  // Capture token usage regardless of whether the JSON parses cleanly below —
+  // billing happens on the API call itself, not on successful parsing.
+  const usage = response.data.usage || { input_tokens: 0, output_tokens: 0 };
+
   try {
     const content = response.data.content[0]?.text || '[]';
     const clean = content.replace(/```json|```/g, '').trim();
-    return JSON.parse(clean);
+    return { flags: JSON.parse(clean), usage };
   } catch (err) {
     if (err.response) {
       console.error('[AIReview] Claude API error:', err.response.status, JSON.stringify(err.response.data));
     } else {
       console.error('[AIReview] Failed to parse Claude response:', err.message);
     }
-    return [];
+    return { flags: [], usage };
   }
 }
 
@@ -795,6 +817,9 @@ async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
     throw err;
   }
 
+  // Same reasoning as analyzeBatch: usage is billed on the call itself.
+  const usage = response.data.usage || { input_tokens: 0, output_tokens: 0 };
+
   try {
     const content = response.data.content[0]?.text || '{}';
     const clean = content.replace(/```json|```/g, '').trim();
@@ -830,10 +855,10 @@ async function analyzeTrends(reviewedMetadata, companyMap, customPrompt) {
       }));
     }
 
-    return result;
+    return { result, usage };
   } catch (err) {
     console.error('[AIReview] Failed to parse trend response:', err.message);
-    return { companyTrends: [], techPatterns: [], sentimentSignals: [] };
+    return { result: { companyTrends: [], techPatterns: [], sentimentSignals: [] }, usage };
   }
 }
 
@@ -942,6 +967,7 @@ async function runReviewJob() {
     const allNewFlags = [];
     const now = new Date().toISOString();
     let totalSkippedTickets = 0;
+    const totalUsage = { input_tokens: 0, output_tokens: 0 }; // accumulated across every successful Claude call this run
 
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
@@ -954,7 +980,10 @@ async function runReviewJob() {
       let batchSucceeded = false;
       while (retries < 3) {
         try {
-          aiFlags = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
+          const result = await analyzeBatch(batch, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
+          aiFlags = result.flags;
+          totalUsage.input_tokens += result.usage.input_tokens || 0;
+          totalUsage.output_tokens += result.usage.output_tokens || 0;
           batchSucceeded = true;
           break;
         } catch (err) {
@@ -1056,7 +1085,12 @@ async function runReviewJob() {
     runState = { ...runState, phase: 'Analyzing long-term trends', progress: 85 };
     const allCompanyIds = [...new Set(Object.values(reviewed).map(m => m?.companyID).filter(Boolean))];
     const allCompanyMap = await fetchCompanyNames(allCompanyIds);
-    const trends = await analyzeTrends(reviewed, allCompanyMap, data.prompts?.trendAnalysis || null);
+    const { result: trends, usage: trendsUsage } = await analyzeTrends(reviewed, allCompanyMap, data.prompts?.trendAnalysis || null);
+    totalUsage.input_tokens += trendsUsage.input_tokens || 0;
+    totalUsage.output_tokens += trendsUsage.output_tokens || 0;
+
+    const estimatedCostUSD = estimateCostUSD(totalUsage);
+    console.log(`[AIReview] Run token usage — input: ${totalUsage.input_tokens}, output: ${totalUsage.output_tokens}, estimated cost: $${estimatedCostUSD.toFixed(2)}`);
 
     const duration = Math.round((Date.now() - startTime) / 1000);
     const finalData = loadData();
@@ -1070,6 +1104,10 @@ async function runReviewJob() {
       lastRunTechNotesTruncated: techNotesTruncatedIds.length,
       lastRunSkipped: totalSkippedTickets,
       lastRunFlagged: allNewFlags.length,
+      lastRunInputTokens: totalUsage.input_tokens,
+      lastRunOutputTokens: totalUsage.output_tokens,
+      lastRunEstimatedCostUSD: Math.round(estimatedCostUSD * 100) / 100,
+      totalEstimatedCostUSD: Math.round(((finalData.reviewStats?.totalEstimatedCostUSD || 0) + estimatedCostUSD) * 100) / 100,
       totalReviewed: Object.keys(finalData.reviewed).length,
       totalFlagged: (finalData.flags || []).length,
       lastRunDuration: `${Math.floor(duration / 60)}m ${duration % 60}s`
@@ -1677,7 +1715,8 @@ router.post('/admin/test-batch', requireOwner, async (req, res, next) => {
     const { contextMap: ticketContextMap, truncatedTicketIds } = await fetchTicketContextNotes(foundTickets.map(t => t.id));
 
     const data = loadData();
-    const aiFlags = await analyzeBatch(foundTickets, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
+    const { flags: aiFlags, usage } = await analyzeBatch(foundTickets, companyMap, data.prompts?.ticketReview || null, ticketContextMap);
+    const estimatedCostUSD = estimateCostUSD(usage);
 
     // Show exactly what was sent to Claude for each ticket, so the flags
     // (or lack thereof) can be sanity-checked against real input.
@@ -1693,7 +1732,9 @@ router.post('/admin/test-batch', requireOwner, async (req, res, next) => {
       requestedTicketNumbers: ticketNumbers,
       unresolvedTicketNumbers,
       inputSummary,
-      aiFlags
+      aiFlags,
+      usage,
+      estimatedCostUSD: Math.round(estimatedCostUSD * 10000) / 10000
     });
   } catch (err) {
     console.error('[AIReview TestBatch] Failed:', err.message);
