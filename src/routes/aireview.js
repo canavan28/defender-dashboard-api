@@ -18,7 +18,15 @@ const LOW_PRIORITY = 4; // AutoTask priority 4 = Low — excluded from AI Review
 const AUTO_CLOSE_NOTE_TITLE_MATCH = 'Auto Closing ticket'; // Matches the "Auto Closing ticket. No response after X business days" note created by AutoTask's "Waiting on Customer" workflow rules. Confirmed via diagnostic testing (ticketID 'in' + title 'contains' on TicketNotes) — see /api/diagnostic/auto-close-notes-test. Per Matt: a ticket with this note means the customer never responded past the initial ticket-open message, and should ALWAYS be excluded from AI Review regardless of ticket content — this is not a real signal, and repeated instances are not a signal either.
 const RMM_RESOLVED_STATUS = 20; // AutoTask ticket status "RMM Resolved" — confirmed via /api/diagnostic/ticket-fields
 const TECH_NOTES_CHAR_CAP = 2000; // Combined TicketNotes + TimeEntries write-up length cap per ticket. Truncation is tracked and logged (see fetchTicketContextNotes) so Matt can see how often real tech write-ups exceed this.
-const SYSTEM_RESOURCE_ID = 4; // "Autotask Administrator" — the system account that authors workflow-rule notes. Confirmed via two real tickets (T20260725.0003, T20260916.0035/0023) that every automated workflow-rule note has creatorResourceID 4. A note with any OTHER creatorResourceID (including null, which is a customer reply via chat) means a real person or the chat-bot was involved.
+const SYSTEM_RESOURCE_ID = 4; // "Autotask Administrator" — the system account that authors workflow-rule notes. Confirmed via two real tickets (T20260725.0003, T20260916.0035/0023) that every automated workflow-rule note has creatorResourceID 4.
+const CHATBOT_RESOURCE_ID = 29682925; // "ChatGenie Integration Account" (chatgenie@infotank.com) — confirmed via /api/diagnostic/resource-lookup, NOT a real technician. Notes attributed to it ("Auto generate title action", "Auto prioritize action", repeated "Recap for this thread" summaries) are verbose and repetitive, and were confirmed to crowd out real human/time-entry content within the TECH_NOTES_CHAR_CAP on at least one real ticket (T20260916.0023). Excluded from techNotes the same way SYSTEM_RESOURCE_ID is.
+
+// Shared check used everywhere we need to know "did an actual human touch
+// this," so the definition of "system/bot" can't drift out of sync between
+// the RMM-resolved detection and the tech-notes content fetch.
+function isSystemOrBotResource(resourceID) {
+  return resourceID === SYSTEM_RESOURCE_ID || resourceID === CHATBOT_RESOURCE_ID;
+}
 const CLAUDE_MODEL = 'claude-opus-4-6';
 // Confirmed via Anthropic's published pricing (Sept 2026) for claude-opus-4-6
 // standard-rate requests (all AI Review calls are well under the 200K-token
@@ -309,7 +317,7 @@ async function fetchTicketNoteCheckResults(ticketIds) {
       let nextPageUrl = null;
       const firstResponse = await autotaskClient.post('/TicketNotes/query', { filter, maxRecords: 500 });
       (firstResponse.data.items || []).forEach(n => {
-        if (n.creatorResourceID !== SYSTEM_RESOURCE_ID) idsWithNonSystemNotes.add(n.ticketID);
+        if (!isSystemOrBotResource(n.creatorResourceID)) idsWithNonSystemNotes.add(n.ticketID);
       });
       nextPageUrl = firstResponse.data.pageDetails?.nextPageUrl || null;
 
@@ -317,7 +325,7 @@ async function fetchTicketNoteCheckResults(ticketIds) {
         await new Promise(r => setTimeout(r, 300));
         const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
         (response.data.items || []).forEach(n => {
-          if (n.creatorResourceID !== SYSTEM_RESOURCE_ID) idsWithNonSystemNotes.add(n.ticketID);
+          if (!isSystemOrBotResource(n.creatorResourceID)) idsWithNonSystemNotes.add(n.ticketID);
         });
         nextPageUrl = response.data.pageDetails?.nextPageUrl || null;
       }
@@ -358,7 +366,7 @@ async function fetchTicketContextNotes(ticketIds) {
       let nextPageUrl = null;
       const firstResponse = await autotaskClient.post('/TicketNotes/query', { filter, maxRecords: 500 });
       (firstResponse.data.items || []).forEach(n => {
-        if (n.creatorResourceID !== SYSTEM_RESOURCE_ID && contextByTicket[n.ticketID] && n.description) {
+        if (!isSystemOrBotResource(n.creatorResourceID) && contextByTicket[n.ticketID] && n.description) {
           contextByTicket[n.ticketID].humanNotes.push(n.description);
         }
       });
@@ -367,7 +375,7 @@ async function fetchTicketContextNotes(ticketIds) {
         await new Promise(r => setTimeout(r, 300));
         const response = await axios.post(nextPageUrl, { filter, maxRecords: 500 }, { headers: getHeaders() });
         (response.data.items || []).forEach(n => {
-          if (n.creatorResourceID !== SYSTEM_RESOURCE_ID && contextByTicket[n.ticketID] && n.description) {
+          if (!isSystemOrBotResource(n.creatorResourceID) && contextByTicket[n.ticketID] && n.description) {
             contextByTicket[n.ticketID].humanNotes.push(n.description);
           }
         });
