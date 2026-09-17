@@ -422,9 +422,13 @@ async function fetchTicketContextNotes(ticketIds) {
   const combined = {};
   const truncatedTicketIds = [];
   Object.entries(contextByTicket).forEach(([id, { humanNotes, timeEntryNotes }]) => {
+    // Time entry write-ups first — confirmed (T20260625.0035) to usually hold
+    // the actual root-cause/resolution content, whereas ticket notes are
+    // often short replies or chat threads. Putting the richer content first
+    // means it survives if the combined text still has to be truncated.
     const parts = [];
-    if (humanNotes.length) parts.push('TECH NOTES:\n' + humanNotes.join('\n---\n'));
     if (timeEntryNotes.length) parts.push('TIME ENTRY WRITE-UPS:\n' + timeEntryNotes.join('\n---\n'));
+    if (humanNotes.length) parts.push('TECH NOTES:\n' + humanNotes.join('\n---\n'));
     let text = parts.length ? parts.join('\n\n') : 'No human notes or time entry write-ups logged on this ticket.';
     if (text.length > TECH_NOTES_CHAR_CAP) {
       text = text.substring(0, TECH_NOTES_CHAR_CAP) + '... [truncated]';
@@ -1089,6 +1093,13 @@ async function runReviewJob() {
       console.warn(`[AIReview] ${totalSkippedTickets} tickets left unreviewed due to batch failures — will retry on next run`);
     }
 
+    // Snapshot batch-only usage BEFORE adding trend-analysis usage. Kept
+    // separate so a future cost estimate can compute an accurate per-ticket
+    // average (the trend-analysis call is a fixed, once-per-run cost that
+    // would otherwise skew a small run's average upward).
+    const batchOnlyUsage = { input_tokens: totalUsage.input_tokens, output_tokens: totalUsage.output_tokens };
+    const ticketsSentToClaude = ticketsForClaude.length - totalSkippedTickets;
+
     // Run trend analysis on all accumulated metadata
     runState = { ...runState, phase: 'Analyzing long-term trends', progress: 85 };
     const allCompanyIds = [...new Set(Object.values(reviewed).map(m => m?.companyID).filter(Boolean))];
@@ -1116,6 +1127,13 @@ async function runReviewJob() {
       lastRunOutputTokens: totalUsage.output_tokens,
       lastRunEstimatedCostUSD: Math.round(estimatedCostUSD * 100) / 100,
       totalEstimatedCostUSD: Math.round(((finalData.reviewStats?.totalEstimatedCostUSD || 0) + estimatedCostUSD) * 100) / 100,
+      // Used by GET /estimate to project the cost of a future run —
+      // batch-only (excludes the trend-analysis call) and per-ticket.
+      lastRunBatchInputTokens: batchOnlyUsage.input_tokens,
+      lastRunBatchOutputTokens: batchOnlyUsage.output_tokens,
+      lastRunTrendsInputTokens: trendsUsage.input_tokens || 0,
+      lastRunTrendsOutputTokens: trendsUsage.output_tokens || 0,
+      lastRunTicketsSentToClaude: ticketsSentToClaude,
       totalReviewed: Object.keys(finalData.reviewed).length,
       totalFlagged: (finalData.flags || []).length,
       lastRunDuration: `${Math.floor(duration / 60)}m ${duration % 60}s`
@@ -1345,6 +1363,89 @@ router.get('/status', (req, res) => {
     runPhase: runState.phase,
     runError: runState.error
   });
+});
+
+// ── Pre-run cost estimate ──────────────────────────────────────────────────
+// Read-only: does every step a real run does UP TO but NOT INCLUDING any
+// Claude API call (fetch candidate tickets, check auto-close and
+// RMM-resolved-no-human-notes exclusions) so it knows the real count of
+// tickets that would actually reach Claude, then projects cost using the
+// per-ticket token average from the most recent real run. Makes no writes,
+// costs nothing to call (AutoTask reads only), safe to call as often as the
+// UI wants — e.g. every time the "Run AI Review" button is clicked, before
+// the person confirms.
+router.get('/estimate', async (req, res, next) => {
+  try {
+    const data = loadData();
+    const excludedCompanyIds = new Set((data.exclusions || []).map(e => e.companyId));
+    const reviewed = data.reviewed || {};
+
+    const allTickets = await fetchAllTicketsForReview();
+    const toReview = allTickets.filter(t =>
+      !reviewed[t.ticketNumber] && !excludedCompanyIds.has(t.companyID)
+    );
+
+    if (toReview.length === 0) {
+      return res.json({
+        candidateTickets: 0,
+        autoClosedExcluded: 0,
+        rmmResolvedExcluded: 0,
+        ticketsForClaude: 0,
+        estimatedTotalCostUSD: 0,
+        note: 'No unreviewed tickets in the current window — a run right now would finish instantly with no Claude cost.'
+      });
+    }
+
+    const autoClosedTicketIds = await fetchAutoClosedTicketIds(toReview.map(t => t.id));
+    const afterAutoClose = toReview.filter(t => !autoClosedTicketIds.has(t.id));
+
+    const rmmCandidates = afterAutoClose.filter(t => t.status === RMM_RESOLVED_STATUS);
+    const { idsWithNonSystemNotes, failedIds } = await fetchTicketNoteCheckResults(rmmCandidates.map(t => t.id));
+    const rmmExcludedIds = new Set(
+      rmmCandidates.filter(t => !idsWithNonSystemNotes.has(t.id) && !failedIds.has(t.id)).map(t => t.id)
+    );
+    const ticketsForClaude = afterAutoClose.filter(t => !rmmExcludedIds.has(t.id));
+
+    const stats = data.reviewStats || {};
+    const priorTickets = stats.lastRunTicketsSentToClaude || 0;
+    const haveBaseline = priorTickets > 0 && stats.lastRunBatchInputTokens != null;
+
+    let estimatedBatchCostUSD = null;
+    if (haveBaseline) {
+      const avgInputPerTicket = stats.lastRunBatchInputTokens / priorTickets;
+      const avgOutputPerTicket = stats.lastRunBatchOutputTokens / priorTickets;
+      estimatedBatchCostUSD = estimateCostUSD({
+        input_tokens: avgInputPerTicket * ticketsForClaude.length,
+        output_tokens: avgOutputPerTicket * ticketsForClaude.length
+      });
+    }
+
+    // Trend analysis is a once-per-run fixed cost, not per-ticket — use the
+    // most recent real trend-analysis cost as a flat estimate. It will
+    // creep up gradually as reviewed history grows, but not sharply run to run.
+    const haveTrendsBaseline = stats.lastRunTrendsInputTokens != null;
+    const estimatedTrendsCostUSD = haveTrendsBaseline
+      ? estimateCostUSD({ input_tokens: stats.lastRunTrendsInputTokens, output_tokens: stats.lastRunTrendsOutputTokens })
+      : null;
+
+    const estimatedTotalCostUSD = (estimatedBatchCostUSD || 0) + (estimatedTrendsCostUSD || 0);
+
+    res.json({
+      candidateTickets: toReview.length,
+      autoClosedExcluded: autoClosedTicketIds.size,
+      rmmResolvedExcluded: rmmExcludedIds.size,
+      ticketsForClaude: ticketsForClaude.length,
+      basedOnPriorRunTickets: priorTickets,
+      estimatedBatchCostUSD: estimatedBatchCostUSD != null ? Math.round(estimatedBatchCostUSD * 100) / 100 : null,
+      estimatedTrendsCostUSD: estimatedTrendsCostUSD != null ? Math.round(estimatedTrendsCostUSD * 100) / 100 : null,
+      estimatedTotalCostUSD: Math.round(estimatedTotalCostUSD * 100) / 100,
+      note: !haveBaseline
+        ? 'No completed run yet to base a per-ticket estimate on — this projection will be available after the first real run finishes.'
+        : null
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.get('/companies', async (req, res, next) => {
