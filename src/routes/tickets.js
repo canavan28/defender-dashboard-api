@@ -11,6 +11,15 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const CACHE_DIR = '/app/data';
 const HISTORICAL_CACHE_FILE = path.join(CACHE_DIR, 'tickets-historical.json');
 const RECENT_CACHE_FILE = path.join(CACHE_DIR, 'tickets-recent.json');
+const HISTORICAL_TE_CACHE_FILE = path.join(CACHE_DIR, 'timeentries-historical.json');
+
+// ── History windows ──────────────────────────────────────────────────────────
+// Time entries now go back as far as tickets do (24 months) so the Time
+// Analytics tab can compare a quarter against the same quarter last year.
+// Previously time entries only went back 6 months.
+const TICKET_HISTORY_MONTHS = 24;
+const TIME_ENTRY_HISTORY_MONTHS = 24;
+const RECENT_DAYS = 30;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
@@ -163,6 +172,23 @@ let recentCache = null;
 let historicalTimeEntryCache = null;
 let recentTimeEntryCache = null;
 
+// Guards against two overlapping historical time-entry builds (e.g. the
+// dashboard auto-syncing while a manual refresh is already running).
+let historicalTEBuild = null;
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d;
+}
+
+function monthsAgo(n) {
+  const d = new Date();
+  d.setMonth(d.getMonth() - n);
+  return d;
+}
+
 // ── Disk cache helpers ────────────────────────────────────────────────────────
 function ensureCacheDir() {
   if (!fs.existsSync(CACHE_DIR)) {
@@ -173,8 +199,9 @@ function ensureCacheDir() {
 function saveCacheToDisk(filePath, data) {
   try {
     ensureCacheDir();
-    fs.writeFileSync(filePath, JSON.stringify(data));
-    console.log(`[Cache] Saved to disk: ${path.basename(filePath)} (${Math.round(JSON.stringify(data).length / 1024)}KB)`);
+    const json = JSON.stringify(data);
+    fs.writeFileSync(filePath, json);
+    console.log(`[Cache] Saved to disk: ${path.basename(filePath)} (${Math.round(json.length / 1024)}KB)`);
   } catch (err) {
     console.error(`[Cache] Failed to save ${filePath}:`, err.message);
   }
@@ -183,8 +210,9 @@ function saveCacheToDisk(filePath, data) {
 function loadCacheFromDisk(filePath) {
   try {
     if (fs.existsSync(filePath)) {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      console.log(`[Cache] Loaded from disk: ${path.basename(filePath)} (${Math.round(JSON.stringify(data).length / 1024)}KB)`);
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(raw);
+      console.log(`[Cache] Loaded from disk: ${path.basename(filePath)} (${Math.round(raw.length / 1024)}KB)`);
       return data;
     }
   } catch (err) {
@@ -198,6 +226,7 @@ function initializeCaches() {
   console.log('[Cache] Initializing from disk...');
   const historical = loadCacheFromDisk(HISTORICAL_CACHE_FILE);
   const recent = loadCacheFromDisk(RECENT_CACHE_FILE);
+  const historicalTE = loadCacheFromDisk(HISTORICAL_TE_CACHE_FILE);
 
   if (historical) {
     historicalCache = historical;
@@ -207,10 +236,46 @@ function initializeCaches() {
     recentCache = recent;
     console.log(`[Cache] Recent loaded: ${recent.allTickets?.length} tickets, built ${recent.builtAt}`);
   }
+  if (historicalTE) {
+    historicalTimeEntryCache = historicalTE;
+    console.log(`[Cache] Historical time entries loaded: ${historicalTE.items?.length} entries since ${historicalTE.since}, built ${historicalTE.builtAt}`);
+  }
 }
 
 // Initialize on module load
 initializeCaches();
+
+// ── Coverage boundaries ───────────────────────────────────────────────────────
+// FIX: the historical ticket cache is only rebuilt on a manual full refresh,
+// but the "recent" fetch always used a fixed 30-day window. If the historical
+// cache was built, say, 3 months ago, it stopped at (3 months ago - 30 days)
+// while recent started at (today - 30 days) — leaving a silent gap of tickets
+// that neither cache contained. Recent now starts wherever historical stops.
+function historicalTicketsCoverUntil() {
+  if (!historicalCache) return null;
+  if (historicalCache.coversUntil) return new Date(historicalCache.coversUntil);
+  // Older caches didn't record this; it was always builtAt minus 30 days.
+  if (historicalCache.builtAt) {
+    const d = new Date(historicalCache.builtAt);
+    d.setDate(d.getDate() - RECENT_DAYS);
+    return d;
+  }
+  return null;
+}
+
+function recentTicketsSince() {
+  const thirty = daysAgo(RECENT_DAYS);
+  const covers = historicalTicketsCoverUntil();
+  return covers && covers < thirty ? covers : thirty;
+}
+
+function recentTimeEntriesSince() {
+  const thirty = daysAgo(RECENT_DAYS);
+  const covers = historicalTimeEntryCache?.coversUntil
+    ? new Date(historicalTimeEntryCache.coversUntil)
+    : null;
+  return covers && covers < thirty ? covers : thirty;
+}
 
 // ── Pagination helpers ────────────────────────────────────────────────────────
 async function queryAllTickets(filter) {
@@ -266,6 +331,32 @@ function mergeTickets(historical, recent) {
   return Object.values(map);
 }
 
+// ── Slim time entries ─────────────────────────────────────────────────────────
+// Only the fields the dashboard actually uses are kept. Note text is replaced
+// with a hasNotes yes/no flag — the frontend only ever checked whether notes
+// existed (notes coverage + tech grading), never displayed the text. This keeps
+// the browser payload small even with 24 months of entries.
+// Project time entries (logged on a project task, not a ticket) also carry
+// the project's name and company, resolved at fetch time.
+function slimTimeEntry(t, projectInfo) {
+  const hasSummary = typeof t.summaryNotes === 'string' && t.summaryNotes.trim().length > 0;
+  const hasInternal = typeof t.internalNotes === 'string' && t.internalNotes.trim().length > 0;
+  return {
+    id: t.id,
+    ticketID: t.ticketID ?? null,
+    taskID: t.taskID ?? null,
+    resourceID: t.resourceID,
+    dateWorked: t.dateWorked,
+    hoursWorked: t.hoursWorked,
+    isNonBillable: !!t.isNonBillable,
+    billingCodeID: t.billingCodeID ?? null,
+    hasNotes: hasSummary || hasInternal,
+    projectID: projectInfo?.projectID ?? null,
+    projectName: projectInfo?.projectName ?? null,
+    projectCompanyID: projectInfo?.companyID ?? null
+  };
+}
+
 // ── Fetch company names (same pattern as aireview.js) ────────────────────────
 async function fetchCompanyNames(companyIds) {
   if (!companyIds.length) return {};
@@ -293,8 +384,26 @@ async function fetchCompanyNames(companyIds) {
   return companyMap;
 }
 
+// ── Work type names (AutoTask BillingCodes) ──────────────────────────────────
+// A time entry's billingCodeID is its Work Type (Remote Support, Onsite, etc.).
+// Resolved dynamically every sync — nothing hardcoded. If this lookup fails,
+// the dashboard still works and shows "Work type <id>" instead of names.
+async function fetchBillingCodeMap() {
+  const map = {};
+  try {
+    const items = await queryAllEntries('/BillingCodes/query', [{ op: 'exist', field: 'id' }]);
+    items.forEach(b => {
+      map[String(b.id)] = b.name;
+    });
+    console.log(`[BillingCodes] Resolved ${Object.keys(map).length} work type names`);
+  } catch (err) {
+    console.warn('[BillingCodes] Could not fetch work type names:', err.response?.status, err.message);
+  }
+  return map;
+}
+
 // ── Build response payload ────────────────────────────────────────────────────
-function buildPayload(resources, companyMap) {
+function buildPayload(resources, companyMap, billingCodeMap) {
   const allTickets = mergeTickets(historicalCache?.allTickets, recentCache?.allTickets);
   const completedTickets = mergeTickets(historicalCache?.completedTickets, recentCache?.completedTickets);
   const openTickets = recentCache?.openTickets || [];
@@ -304,7 +413,6 @@ function buildPayload(resources, companyMap) {
     timeEntryMap[t.id] = t;
   });
   const timeEntries = Object.values(timeEntryMap);
-
 
   return {
     allTickets,
@@ -316,12 +424,22 @@ function buildPayload(resources, companyMap) {
     issueTypeMap: ISSUE_TYPE_MAP,
     subIssueMap: SUB_ISSUE_MAP,
     companyMap,
+    billingCodeMap: billingCodeMap || {},
     cacheInfo: {
       historicalBuiltAt: historicalCache?.builtAt,
       recentBuiltAt: recentCache?.builtAt,
+      recentTicketsSince: recentCache?.since || null,
       timeEntriesBuiltAt: recentTimeEntryCache?.builtAt,
+      timeEntriesHistoricalBuiltAt: historicalTimeEntryCache?.builtAt || null,
+      // Earliest date time entries are guaranteed complete from. The frontend
+      // uses this to decide whether a prior-year comparison is trustworthy.
+      timeEntriesSince: historicalTimeEntryCache?.since || recentTimeEntryCache?.since || null,
       totalTickets: allTickets.length,
       totalTimeEntries: timeEntries.length,
+      projectTimeEntries: timeEntries.filter(t => !t.ticketID && t.taskID).length,
+      // Non-null means project time is missing or incomplete — the Time
+      // Analytics tab shows a warning. Fix with /api/tickets/refreshtimeentries.
+      projectTimeError: historicalTimeEntryCache?.projectTimeError || recentTimeEntryCache?.projectTimeError || null,
       loadedFromDisk: historicalCache?.loadedFromDisk || false
     }
   };
@@ -348,15 +466,13 @@ const queueFilter = {
 // ── Ticket fetchers ───────────────────────────────────────────────────────────
 async function fetchHistorical() {
   console.log('[Cache] Building historical ticket cache...');
-  const twentyFourMonthsAgo = new Date();
-  twentyFourMonthsAgo.setMonth(twentyFourMonthsAgo.getMonth() - 24);
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const since = monthsAgo(TICKET_HISTORY_MONTHS);
+  const until = daysAgo(RECENT_DAYS);
 
   const allTickets = await queryAllTickets([
     queueFilter,
-    { field: 'createDate', op: 'gte', value: twentyFourMonthsAgo.toISOString() },
-    { field: 'createDate', op: 'lt', value: thirtyDaysAgo.toISOString() },
+    { field: 'createDate', op: 'gte', value: since.toISOString() },
+    { field: 'createDate', op: 'lt', value: until.toISOString() },
     { field: 'status', op: 'noteq', value: 20 }
   ]);
   await sleep(500);
@@ -365,24 +481,29 @@ async function fetchHistorical() {
     queueFilter,
     { field: 'status', op: 'eq', value: 5 },
     { field: 'completedDate', op: 'exist' },
-    { field: 'createDate', op: 'gte', value: twentyFourMonthsAgo.toISOString() },
-    { field: 'createDate', op: 'lt', value: thirtyDaysAgo.toISOString() }
+    { field: 'createDate', op: 'gte', value: since.toISOString() },
+    { field: 'createDate', op: 'lt', value: until.toISOString() }
   ]);
 
   console.log(`[Cache] Historical tickets: ${allTickets.length} all, ${completedTickets.length} completed`);
-  const cache = { allTickets, completedTickets, builtAt: new Date().toISOString() };
+  const cache = {
+    allTickets,
+    completedTickets,
+    since: since.toISOString(),
+    coversUntil: until.toISOString(),
+    builtAt: new Date().toISOString()
+  };
   saveCacheToDisk(HISTORICAL_CACHE_FILE, cache);
   return cache;
 }
 
 async function fetchRecent() {
-  console.log('[Cache] Refreshing recent ticket cache...');
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const since = recentTicketsSince();
+  console.log(`[Cache] Refreshing recent ticket cache (since ${since.toISOString()})...`);
 
   const allTickets = await queryAllTickets([
     queueFilter,
-    { field: 'createDate', op: 'gte', value: thirtyDaysAgo.toISOString() },
+    { field: 'createDate', op: 'gte', value: since.toISOString() },
     { field: 'status', op: 'noteq', value: 20 }
   ]);
   await sleep(500);
@@ -400,53 +521,150 @@ async function fetchRecent() {
     queueFilter,
     { field: 'status', op: 'eq', value: 5 },
     { field: 'completedDate', op: 'exist' },
-    { field: 'createDate', op: 'gte', value: thirtyDaysAgo.toISOString() }
+    { field: 'createDate', op: 'gte', value: since.toISOString() }
   ]);
 
   console.log(`[Cache] Recent tickets: ${allTickets.length} all, ${openTickets.length} open, ${completedTickets.length} completed`);
-  const cache = { allTickets, openTickets, completedTickets, builtAt: new Date().toISOString() };
+  const cache = {
+    allTickets,
+    openTickets,
+    completedTickets,
+    since: since.toISOString(),
+    builtAt: new Date().toISOString()
+  };
   saveCacheToDisk(RECENT_CACHE_FILE, cache);
   return cache;
 }
 
 // ── Time entry fetchers ───────────────────────────────────────────────────────
-async function fetchHistoricalTimeEntries(ticketIDSet) {
-  console.log('[TimeEntries] Building historical cache...');
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+// Two kinds of time are pulled:
+//   1. Ticket time — ticketID exists, ticket must be in the included queues
+//      (same rule as before).
+//   2. Project time — logged against a project task (taskID exists, no
+//      ticket). New: previously project time never reached the dashboard.
+// If the project-time fetch fails, ticket time still loads and the error is
+// recorded (projectTimeError) so the Time Analytics tab can warn about it
+// instead of silently showing lower totals.
 
-  const items = await queryAllEntries('/TimeEntries/query', [
-    { field: 'dateWorked', op: 'gte', value: sixMonthsAgo.toISOString() },
-    { field: 'dateWorked', op: 'lt', value: thirtyDaysAgo.toISOString() },
+// taskID -> { projectID, projectName, companyID }
+async function resolveTaskProjects(taskIds) {
+  const info = {};
+  if (!taskIds.length) return info;
+  try {
+    const CHUNK = 500;
+    const taskToProject = {};
+    for (let i = 0; i < taskIds.length; i += CHUNK) {
+      const chunk = taskIds.slice(i, i + CHUNK);
+      const tasks = await queryAllEntries('/Tasks/query', [{ field: 'id', op: 'in', value: chunk }]);
+      tasks.forEach(t => { taskToProject[t.id] = t.projectID; });
+      await sleep(300);
+    }
+
+    const projectIds = [...new Set(Object.values(taskToProject).filter(Boolean))];
+    const projects = {};
+    for (let i = 0; i < projectIds.length; i += CHUNK) {
+      const chunk = projectIds.slice(i, i + CHUNK);
+      const items = await queryAllEntries('/Projects/query', [{ field: 'id', op: 'in', value: chunk }]);
+      items.forEach(p => { projects[p.id] = { projectName: p.projectName, companyID: p.companyID }; });
+      await sleep(300);
+    }
+
+    taskIds.forEach(id => {
+      const pid = taskToProject[id] ?? null;
+      info[id] = {
+        projectID: pid,
+        projectName: pid != null ? (projects[pid]?.projectName || null) : null,
+        companyID: pid != null ? (projects[pid]?.companyID ?? null) : null
+      };
+    });
+    console.log(`[TimeEntries] Resolved ${Object.keys(taskToProject).length} tasks to ${projectIds.length} projects`);
+  } catch (err) {
+    // Hours still count — only the project name/company is missing.
+    console.warn('[TimeEntries] Could not resolve tasks to projects:', err.response?.status, err.message);
+  }
+  return info;
+}
+
+async function fetchProjectTimeEntries(since, until) {
+  const filter = [
+    { field: 'dateWorked', op: 'gte', value: since.toISOString() },
+    ...(until ? [{ field: 'dateWorked', op: 'lt', value: until.toISOString() }] : []),
+    { field: 'taskID', op: 'exist' }
+  ];
+  const items = (await queryAllEntries('/TimeEntries/query', filter))
+    .filter(t => !EXCLUDE_RESOURCES_SET.has(t.resourceID) && !t.ticketID);
+
+  await sleep(300);
+  const taskIds = [...new Set(items.map(t => t.taskID).filter(Boolean))];
+  const taskInfo = await resolveTaskProjects(taskIds);
+  return items.map(t => slimTimeEntry(t, taskInfo[t.taskID]));
+}
+
+async function fetchTimeEntriesRange(since, until, ticketIDSet, label) {
+  const ticketFilter = [
+    { field: 'dateWorked', op: 'gte', value: since.toISOString() },
+    ...(until ? [{ field: 'dateWorked', op: 'lt', value: until.toISOString() }] : []),
     { field: 'ticketID', op: 'exist' }
-  ]);
+  ];
+  const ticketRaw = await queryAllEntries('/TimeEntries/query', ticketFilter);
+  const ticketItems = ticketRaw
+    .filter(t => !EXCLUDE_RESOURCES_SET.has(t.resourceID) && ticketIDSet.has(t.ticketID))
+    .map(t => slimTimeEntry(t));
 
-  const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) && ticketIDSet.has(t.ticketID)
-  );
+  let projectItems = [];
+  let projectTimeError = null;
+  try {
+    await sleep(500);
+    projectItems = await fetchProjectTimeEntries(since, until);
+  } catch (err) {
+    projectTimeError = `${err.response?.status || ''} ${err.message}`.trim();
+    console.error(`[TimeEntries] ${label}: project time fetch FAILED:`, projectTimeError);
+  }
 
-  console.log(`[TimeEntries] Historical: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date().toISOString() };
+  console.log(`[TimeEntries] ${label}: ${ticketRaw.length} ticket entries raw, ${ticketItems.length} after filter; ${projectItems.length} project entries`);
+  return { items: [...ticketItems, ...projectItems], projectTimeError };
+}
+
+async function fetchHistoricalTimeEntries(ticketIDSet) {
+  const since = monthsAgo(TIME_ENTRY_HISTORY_MONTHS);
+  const until = daysAgo(RECENT_DAYS);
+  console.log(`[TimeEntries] Building historical cache (${since.toISOString()} to ${until.toISOString()})...`);
+
+  const { items, projectTimeError } = await fetchTimeEntriesRange(since, until, ticketIDSet, 'Historical');
+
+  const cache = {
+    items,
+    projectTimeError,
+    since: since.toISOString(),
+    coversUntil: until.toISOString(),
+    builtAt: new Date().toISOString()
+  };
+  saveCacheToDisk(HISTORICAL_TE_CACHE_FILE, cache);
+  return cache;
+}
+
+function buildHistoricalTimeEntries(ticketIDSet) {
+  if (!historicalTEBuild) {
+    historicalTEBuild = fetchHistoricalTimeEntries(ticketIDSet)
+      .then(cache => {
+        historicalTimeEntryCache = cache;
+        return cache;
+      })
+      .finally(() => {
+        historicalTEBuild = null;
+      });
+  } else {
+    console.log('[TimeEntries] Historical build already running — waiting on it instead of starting another');
+  }
+  return historicalTEBuild;
 }
 
 async function fetchRecentTimeEntries(ticketIDSet) {
-  console.log('[TimeEntries] Refreshing recent cache...');
-  const thirtyDaysAgo = new Date();
-  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  const since = recentTimeEntriesSince();
+  console.log(`[TimeEntries] Refreshing recent cache (since ${since.toISOString()})...`);
 
-  const items = await queryAllEntries('/TimeEntries/query', [
-    { field: 'dateWorked', op: 'gte', value: thirtyDaysAgo.toISOString() },
-    { field: 'ticketID', op: 'exist' }
-  ]);
-
-  const filtered = items.filter(t =>
-    !EXCLUDE_RESOURCES_SET.has(t.resourceID) && ticketIDSet.has(t.ticketID)
-  );
-
-  console.log(`[TimeEntries] Recent: ${items.length} total, ${filtered.length} after filter`);
-  return { items: filtered, builtAt: new Date().toISOString() };
+  const { items, projectTimeError } = await fetchTimeEntriesRange(since, null, ticketIDSet, 'Recent');
+  return { items, projectTimeError, since: since.toISOString(), builtAt: new Date().toISOString() };
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -465,15 +683,23 @@ router.get('/all', async (req, res, next) => {
     const ticketIDSet = new Set(allTickets.map(t => t.id));
 
     if (!historicalTimeEntryCache) {
-      historicalTimeEntryCache = await fetchHistoricalTimeEntries(ticketIDSet);
+      await buildHistoricalTimeEntries(ticketIDSet);
     }
 
     recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
 
     const resources = await fetchResources();
-    const companyIds = [...new Set(allTickets.map(t => t.companyID).filter(Boolean))];
+    const projectCompanyIds = [
+      ...(historicalTimeEntryCache?.items || []),
+      ...(recentTimeEntryCache?.items || [])
+    ].map(t => t.projectCompanyID).filter(Boolean);
+    const companyIds = [...new Set([
+      ...allTickets.map(t => t.companyID).filter(Boolean),
+      ...projectCompanyIds
+    ])];
     const companyMap = await fetchCompanyNames(companyIds);
-    res.json(buildPayload(resources, companyMap));
+    const billingCodeMap = await fetchBillingCodeMap();
+    res.json(buildPayload(resources, companyMap, billingCodeMap));
   } catch (err) {
     next(err);
   }
@@ -508,13 +734,12 @@ router.get('/refreshtimeentries', async (req, res, next) => {
     }
 
     console.log('[FullRefresh] Step 2: Rebuilding time entry caches...');
-    historicalTimeEntryCache = null;
-    recentTimeEntryCache = null;
+    // The old caches keep serving the dashboard until the new ones are ready.
 
     const allTickets = mergeTickets(historicalCache.allTickets, recentCache.allTickets);
     const ticketIDSet = new Set(allTickets.map(t => t.id));
 
-    historicalTimeEntryCache = await fetchHistoricalTimeEntries(ticketIDSet);
+    await buildHistoricalTimeEntries(ticketIDSet);
     recentTimeEntryCache = await fetchRecentTimeEntries(ticketIDSet);
 
     const timeEntryMap = {};
@@ -525,6 +750,9 @@ router.get('/refreshtimeentries', async (req, res, next) => {
     res.json({
       ok: true,
       totalTimeEntries: Object.keys(timeEntryMap).length,
+      timeEntriesSince: historicalTimeEntryCache.since,
+      projectTimeEntries: Object.values(timeEntryMap).filter(t => !t.ticketID && t.taskID).length,
+      projectTimeError: historicalTimeEntryCache.projectTimeError || recentTimeEntryCache.projectTimeError || null,
       historicalBuiltAt: historicalTimeEntryCache.builtAt,
       recentBuiltAt: recentTimeEntryCache.builtAt
     });
