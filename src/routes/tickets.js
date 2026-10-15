@@ -336,13 +336,18 @@ function mergeTickets(historical, recent) {
 // with a hasNotes yes/no flag — the frontend only ever checked whether notes
 // existed (notes coverage + tech grading), never displayed the text. This keeps
 // the browser payload small even with 24 months of entries.
-// Project time entries (logged on a project task, not a ticket) also carry
-// the project's name and company, resolved at fetch time.
-function slimTimeEntry(t, projectInfo) {
+// Every entry is labelled with entryKind:
+//   'ticket'   — logged on a ticket
+//   'project'  — logged on a real project task (carries project name/company)
+//   'internal' — internal time (Admin Time, Internal Meeting, Training, etc.).
+//                AutoTask gives these a task-like ID that isn't a real project
+//                task — confirmed: ~4,100 entries across only 6 such IDs.
+function slimTimeEntry(t, projectInfo, entryKind = 'ticket') {
   const hasSummary = typeof t.summaryNotes === 'string' && t.summaryNotes.trim().length > 0;
   const hasInternal = typeof t.internalNotes === 'string' && t.internalNotes.trim().length > 0;
   return {
     id: t.id,
+    entryKind,
     ticketID: t.ticketID ?? null,
     taskID: t.taskID ?? null,
     resourceID: t.resourceID,
@@ -436,7 +441,8 @@ function buildPayload(resources, companyMap, billingCodeMap) {
       timeEntriesSince: historicalTimeEntryCache?.since || recentTimeEntryCache?.since || null,
       totalTickets: allTickets.length,
       totalTimeEntries: timeEntries.length,
-      projectTimeEntries: timeEntries.filter(t => !t.ticketID && t.taskID).length,
+      projectTimeEntries: timeEntries.filter(t => t.entryKind === 'project').length,
+      internalTimeEntries: timeEntries.filter(t => t.entryKind === 'internal').length,
       // Non-null means project time is missing or incomplete — the Time
       // Analytics tab shows a warning. Fix with /api/tickets/refreshtimeentries.
       projectTimeError: historicalTimeEntryCache?.projectTimeError || recentTimeEntryCache?.projectTimeError || null,
@@ -540,16 +546,21 @@ async function fetchRecent() {
 // Two kinds of time are pulled:
 //   1. Ticket time — ticketID exists, ticket must be in the included queues
 //      (same rule as before).
-//   2. Project time — logged against a project task (taskID exists, no
-//      ticket). New: previously project time never reached the dashboard.
+//   2. Non-ticket time (taskID exists, no ticket) — split into real project
+//      task time and internal time. New: previously neither reached the
+//      dashboard.
 // If the project-time fetch fails, ticket time still loads and the error is
 // recorded (projectTimeError) so the Time Analytics tab can warn about it
 // instead of silently showing lower totals.
 
-// taskID -> { projectID, projectName, companyID }
+// Returns { info: taskID -> { projectID, projectName, companyID }, lookupOk }.
+// Only real project tasks appear in info. IDs AutoTask doesn't return as tasks
+// are internal-time categories. lookupOk = false means the lookup itself
+// failed, so we can't tell project from internal time.
 async function resolveTaskProjects(taskIds) {
   const info = {};
-  if (!taskIds.length) return info;
+  let lookupOk = true;
+  if (!taskIds.length) return { info, lookupOk };
   try {
     const CHUNK = 500;
     const taskToProject = {};
@@ -570,6 +581,7 @@ async function resolveTaskProjects(taskIds) {
     }
 
     taskIds.forEach(id => {
+      if (!(id in taskToProject)) return; // not a real task -> internal time
       const pid = taskToProject[id] ?? null;
       info[id] = {
         projectID: pid,
@@ -577,12 +589,12 @@ async function resolveTaskProjects(taskIds) {
         companyID: pid != null ? (projects[pid]?.companyID ?? null) : null
       };
     });
-    console.log(`[TimeEntries] Resolved ${Object.keys(taskToProject).length} tasks to ${projectIds.length} projects`);
+    console.log(`[TimeEntries] ${taskIds.length} task IDs: ${Object.keys(taskToProject).length} real project tasks across ${projectIds.length} projects, ${taskIds.length - Object.keys(taskToProject).length} internal-time categories`);
   } catch (err) {
-    // Hours still count — only the project name/company is missing.
+    lookupOk = false;
     console.warn('[TimeEntries] Could not resolve tasks to projects:', err.response?.status, err.message);
   }
-  return info;
+  return { info, lookupOk };
 }
 
 async function fetchProjectTimeEntries(since, until) {
@@ -596,8 +608,18 @@ async function fetchProjectTimeEntries(since, until) {
 
   await sleep(300);
   const taskIds = [...new Set(items.map(t => t.taskID).filter(Boolean))];
-  const taskInfo = await resolveTaskProjects(taskIds);
-  return items.map(t => slimTimeEntry(t, taskInfo[t.taskID]));
+  const { info: taskInfo, lookupOk } = await resolveTaskProjects(taskIds);
+  const slimmed = items.map(t => {
+    const found = taskInfo[t.taskID];
+    // If the lookup failed, call everything 'project' rather than mislabel
+    // real project work as internal — and report the failure.
+    const kind = found ? 'project' : (lookupOk ? 'internal' : 'project');
+    return slimTimeEntry(t, found, kind);
+  });
+  return {
+    items: slimmed,
+    lookupError: lookupOk ? null : 'Could not match project time to projects (task lookup failed)'
+  };
 }
 
 async function fetchTimeEntriesRange(since, until, ticketIDSet, label) {
@@ -615,13 +637,15 @@ async function fetchTimeEntriesRange(since, until, ticketIDSet, label) {
   let projectTimeError = null;
   try {
     await sleep(500);
-    projectItems = await fetchProjectTimeEntries(since, until);
+    const result = await fetchProjectTimeEntries(since, until);
+    projectItems = result.items;
+    if (result.lookupError) projectTimeError = result.lookupError;
   } catch (err) {
     projectTimeError = `${err.response?.status || ''} ${err.message}`.trim();
     console.error(`[TimeEntries] ${label}: project time fetch FAILED:`, projectTimeError);
   }
 
-  console.log(`[TimeEntries] ${label}: ${ticketRaw.length} ticket entries raw, ${ticketItems.length} after filter; ${projectItems.length} project entries`);
+  console.log(`[TimeEntries] ${label}: ${ticketRaw.length} ticket entries raw, ${ticketItems.length} after filter; ${projectItems.filter(t => t.entryKind === 'project').length} project entries, ${projectItems.filter(t => t.entryKind === 'internal').length} internal-time entries`);
   return { items: [...ticketItems, ...projectItems], projectTimeError };
 }
 
@@ -751,7 +775,8 @@ router.get('/refreshtimeentries', async (req, res, next) => {
       ok: true,
       totalTimeEntries: Object.keys(timeEntryMap).length,
       timeEntriesSince: historicalTimeEntryCache.since,
-      projectTimeEntries: Object.values(timeEntryMap).filter(t => !t.ticketID && t.taskID).length,
+      projectTimeEntries: Object.values(timeEntryMap).filter(t => t.entryKind === 'project').length,
+      internalTimeEntries: Object.values(timeEntryMap).filter(t => t.entryKind === 'internal').length,
       projectTimeError: historicalTimeEntryCache.projectTimeError || recentTimeEntryCache.projectTimeError || null,
       historicalBuiltAt: historicalTimeEntryCache.builtAt,
       recentBuiltAt: recentTimeEntryCache.builtAt
