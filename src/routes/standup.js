@@ -52,10 +52,35 @@ const WEB_DEV_ISSUE_TYPE = 19;
 // tickets regardless of his current active status.
 const WEB_DEV_RESOURCE_IDS = new Set([29682893, 29682894, 29682895]); // Joe Lozier, Carissa Malone, Mark Lamson
 
-// Dragging-ticket thresholds — confirmed with Matt, all three are OR'd, not AND'd
-const DRAGGING_DAYS_OPEN_THRESHOLD = 3;
-const DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD = 48;
-const DRAGGING_TIME_ENTRY_THRESHOLD = 4;
+// Dragging-ticket rules — revised with Matt after the first version showed
+// 34 tickets, too long for a daily standup. A ticket is "dragging" if it is
+// NOT Waiting Customer / On Hold (those are expected to sit) AND any of:
+//   A) no update in 48+ hours
+//   B) open more than 7 days AND no update in 24+ hours
+//   C) more than 5 time entries logged (regardless of how recent the activity)
+const DRAGGING_EXCLUDED_STATUSES = new Set([7, 17]); // 7 = Waiting Customer, 17 = On Hold
+const DRAGGING_STALLED_HOURS = 48;
+const DRAGGING_AGED_DAYS = 7;
+const DRAGGING_AGED_STALLED_HOURS = 24;
+const DRAGGING_TIME_ENTRY_THRESHOLD = 5; // "more than 5" => 6+
+
+// AI escalations shown on the standup: only these severities (Matt: "High
+// and Critical"). Lower severities are counted but not listed.
+const AI_ESCALATION_SEVERITIES = new Set(['critical', 'high']);
+const AI_SEV_RANK = { critical: 0, high: 1 };
+
+// Full ticket status picklist — decoded from /api/diagnostic/ticket-fields.
+// Replaces the earlier scheduled-only label map so dragging tickets show a
+// readable status instead of a raw number.
+const TICKET_STATUS_LABELS = {
+  1: 'New', 5: 'Complete', 7: 'Waiting Customer', 8: 'In Progress', 9: 'Waiting Materials',
+  10: 'Assigned', 11: 'Escalate', 12: 'Waiting Vendor', 16: 'Work Complete', 17: 'On Hold',
+  19: 'Customer Note Added', 20: 'RMM Resolved', 21: 'Co-Managed', 22: 'Scheduled - Phone Call',
+  23: 'Re-Opened', 24: 'Waiting on Engineer', 25: 'Acknowledged', 26: '1st Attempt',
+  27: '2nd Attempt', 29: 'Needs Review', 30: 'Escalated', 31: 'Scheduled for Remote',
+  32: 'Scheduled for Onsite', 33: 'Scheduled for Flex', 34: 'Auto Dispatch', 35: 'Procurement',
+  36: 'Approval Pending', 37: 'Not Approved', 39: 'Hot Swap', 40: 'In Transit', 41: 'Scheduled - Onsite'
+};
 
 // Project constants — confirmed via /api/diagnostic/project-fields this session
 const ENGINEERING_DEPARTMENT_ID = 29683471;
@@ -196,6 +221,46 @@ function summarizeTaskProgress(tasks) {
   return { done, total: tasks.length, percent: Math.round((done / tasks.length) * 100) };
 }
 
+// ── AI flag de-duplication ───────────────────────────────────────────────────
+// Many flags are the same alert firing repeatedly (e.g. the same Datto backup
+// error raised as 5 separate tickets). Two flags are treated as duplicates
+// when their normalized titles match: lowercased, parenthetical bits (device
+// IDs like "(405b7f640de0)") and long hex strings removed, leading Fw:/Re:
+// stripped, punctuation collapsed. Titles that are merely reworded versions
+// of the same alert will NOT match — that's a deliberate limit, since a
+// looser rule (e.g. same company + same flag type) would merge genuinely
+// different problems at a busy client.
+function normalizeTitle(title) {
+  return String(title || '')
+    .toLowerCase()
+    .replace(/^\s*((fw|fwd|re)\s*:\s*)+/g, '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\b[0-9a-f]{8,}\b/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+// Keeps one flag per duplicate group — the most severe, then most recently
+// flagged — and records how many others it stands in for. Nothing is
+// silently dropped: the UI shows "+N similar" on the survivor.
+function groupDuplicateFlags(flags) {
+  const groups = new Map();
+  for (const f of flags) {
+    const key = normalizeTitle(f.title) || `__untitled__${f.id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  }
+  const best = (a, b) => {
+    const sevDiff = (AI_SEV_RANK[a.sev] ?? 9) - (AI_SEV_RANK[b.sev] ?? 9);
+    if (sevDiff !== 0) return sevDiff;
+    return new Date(b.dateFlagged).getTime() - new Date(a.dateFlagged).getTime();
+  };
+  return [...groups.values()].map(group => {
+    const sorted = [...group].sort(best);
+    return { ...sorted[0], similarCount: group.length - 1 };
+  });
+}
+
 // ── Route ──────────────────────────────────────────────────────────────────
 router.get('/data', async (req, res, next) => {
   try {
@@ -222,7 +287,8 @@ router.get('/data', async (req, res, next) => {
       .filter(t =>
         t.queueID !== WEB_DEV_QUEUE_ID &&
         t.issueType !== WEB_DEV_ISSUE_TYPE &&
-        !WEB_DEV_RESOURCE_IDS.has(t.assignedResourceID)
+        !WEB_DEV_RESOURCE_IDS.has(t.assignedResourceID) &&
+        !DRAGGING_EXCLUDED_STATUSES.has(t.status) // Waiting Customer / On Hold are expected to sit
       )
       .map(t => {
         const created = t.createDate ? new Date(t.createDate).getTime() : null;
@@ -231,20 +297,32 @@ router.get('/data', async (req, res, next) => {
         const hoursSinceActivity = lastActivity ? (nowMs - lastActivity) / (1000 * 60 * 60) : null;
         const timeEntryCount = timeEntryCounts[t.id] || 0;
 
+        // A) no update in 48+ hours
+        const stalled = hoursSinceActivity != null && hoursSinceActivity > DRAGGING_STALLED_HOURS;
+        // B) open > 7 days AND no update in 24+ hours
+        const agedAndQuiet =
+          daysOpen != null && daysOpen > DRAGGING_AGED_DAYS &&
+          hoursSinceActivity != null && hoursSinceActivity > DRAGGING_AGED_STALLED_HOURS;
+        // C) more than 5 time entries, regardless of how recent the activity is
+        const heavyTime = timeEntryCount > DRAGGING_TIME_ENTRY_THRESHOLD;
+
         const reasons = [];
-        if (daysOpen != null && daysOpen > DRAGGING_DAYS_OPEN_THRESHOLD) {
-          reasons.push(`Open ${daysOpen.toFixed(1)} days`);
-        }
-        if (hoursSinceActivity != null && hoursSinceActivity > DRAGGING_HOURS_NO_ACTIVITY_THRESHOLD) {
+        if (stalled || agedAndQuiet) {
           reasons.push(`No update in ${Math.round(hoursSinceActivity)}h`);
+          if (daysOpen != null && daysOpen > DRAGGING_AGED_DAYS) {
+            reasons.push(`Open ${Math.round(daysOpen)} days`);
+          }
         }
-        if (timeEntryCount > DRAGGING_TIME_ENTRY_THRESHOLD) {
+        if (heavyTime) {
           reasons.push(`${timeEntryCount} time entries logged`);
         }
 
         return { ticket: t, daysOpen, hoursSinceActivity, timeEntryCount, reasons };
       })
-      .filter(d => d.reasons.length > 0);
+      .filter(d => d.reasons.length > 0)
+      // Worst first = longest since last update. Tickets caught only by the
+      // time-entry rule have recent activity, so they sort toward the end.
+      .sort((a, b) => (b.hoursSinceActivity ?? -1) - (a.hoursSinceActivity ?? -1));
 
     // ── AI Review escalations — direct read of reviewed.json's flags array ─
     // Restricted to the last 7 days (by dateFlagged, not the underlying
@@ -253,11 +331,24 @@ router.get('/data', async (req, res, next) => {
     // every unactioned flag going back months.
     const sevenDaysAgoMs = nowMs - 7 * 24 * 60 * 60 * 1000;
     const reviewedData = loadJsonFile(REVIEWED_FILE);
-    const aiEscalations = (reviewedData?.flags || []).filter(f =>
+    // id is the ticket number; a few old flags lack it (past AI Review glitch)
+    // and would render with a broken link, so they're skipped entirely.
+    const recentUnactioned = (reviewedData?.flags || []).filter(f =>
+      f.id &&
       f.action === 'unactioned' &&
       f.dateFlagged &&
       new Date(f.dateFlagged).getTime() >= sevenDaysAgoMs
     );
+    // Standup shows high + critical only, with repeats grouped (see
+    // groupDuplicateFlags). Anything lower is counted so the UI can point
+    // at the AI Review tab instead of hiding it without a trace.
+    const importantFlags = recentUnactioned.filter(f => AI_ESCALATION_SEVERITIES.has(f.sev));
+    const aiEscalationsOtherCount = recentUnactioned.length - importantFlags.length;
+    const aiEscalations = groupDuplicateFlags(importantFlags).sort((a, b) => {
+      const sevDiff = (AI_SEV_RANK[a.sev] ?? 9) - (AI_SEV_RANK[b.sev] ?? 9);
+      if (sevDiff !== 0) return sevDiff;
+      return new Date(b.dateFlagged).getTime() - new Date(a.dateFlagged).getTime();
+    });
 
     // ── Engineering projects ────────────────────────────────────────────────
     const engineeringProjectsRaw = await fetchOpenProjects([
@@ -325,6 +416,34 @@ router.get('/data', async (req, res, next) => {
     onboardingOverdue.forEach(o => companyIds.add(o.project.companyID));
     const companyMap = await fetchCompanyNames([...companyIds].filter(id => id != null));
 
+    // ── Task formatting for the expandable project rows ────────────────────
+    // Open tasks first (soonest due date first, undated last), completed
+    // tasks after. daysOverdue is only non-zero for tasks that are not done
+    // and past their due date; the page decides whether to flag it (it does
+    // for onboarding, but not for engineering projects, where some projects
+    // have every task stamped with the project's creation date, which would
+    // make every task look weeks overdue).
+    const formatTask = (t) => {
+      const done = isTaskDone(t);
+      const dueMs = t.endDateTime ? new Date(t.endDateTime).getTime() : null;
+      const overdue = !done && dueMs != null && dueMs < nowMs;
+      return {
+        taskNumber: t.taskNumber,
+        title: t.title || '',
+        assignedTech: resourceMap[t.assignedResourceID] || 'Unassigned',
+        statusLabel: TICKET_STATUS_LABELS[t.status] || String(t.status),
+        endDateTime: t.endDateTime || null,
+        done,
+        daysOverdue: overdue ? Math.floor((nowMs - dueMs) / (1000 * 60 * 60 * 24)) : 0
+      };
+    };
+    const formatTasks = (tasks) => (tasks || []).map(formatTask).sort((a, b) => {
+      if (a.done !== b.done) return a.done ? 1 : -1;
+      const ad = a.endDateTime ? new Date(a.endDateTime).getTime() : Infinity;
+      const bd = b.endDateTime ? new Date(b.endDateTime).getTime() : Infinity;
+      return ad - bd;
+    });
+
     // ── Shape response ───────────────────────────────────────────────────────
     const formatTicket = (t) => ({
       id: t.id,
@@ -333,7 +452,7 @@ router.get('/data', async (req, res, next) => {
       companyName: companyMap[String(t.companyID)] || 'Unknown',
       assignedTech: resourceMap[t.assignedResourceID] || 'Unassigned',
       status: t.status,
-      statusLabel: SCHEDULED_STATUS_LABELS[t.status] || String(t.status)
+      statusLabel: TICKET_STATUS_LABELS[t.status] || SCHEDULED_STATUS_LABELS[t.status] || String(t.status)
     });
 
     res.json({
@@ -350,6 +469,7 @@ router.get('/data', async (req, res, next) => {
       })),
 
       aiEscalations,
+      aiEscalationsOtherCount,
 
       engineeringProjects: engineeringProjects.map(p => ({
         id: p.id,
@@ -358,23 +478,22 @@ router.get('/data', async (req, res, next) => {
         status: p.status,
         statusLabel: PROJECT_STATUS_LABELS[p.status] || String(p.status),
         taskProgress: summarizeTaskProgress(taskCache.get(p.id)),
+        tasks: formatTasks(taskCache.get(p.id)),
         endDateTime: p.endDateTime,
         isOverdue: !!(p.endDateTime && new Date(p.endDateTime).getTime() < nowMs),
         projectLead: resourceMap[p.projectLeadResourceID] || null
       })),
 
+      // Still only onboarding projects that HAVE overdue tasks (that's what
+      // this section is for), but each now carries its full task list so
+      // the row can expand; overdueCount drives the badge and section total.
       onboardingOverdue: onboardingOverdue.map(o => ({
         projectId: o.project.id,
         projectName: o.project.projectName,
         companyName: companyMap[String(o.project.companyID)] || 'Unknown',
         taskProgress: summarizeTaskProgress(taskCache.get(o.project.id)),
-        tasks: o.overdueTasks.map(t => ({
-          taskNumber: t.taskNumber,
-          title: t.title,
-          assignedTech: resourceMap[t.assignedResourceID] || 'Unassigned',
-          endDateTime: t.endDateTime,
-          daysOverdue: Math.floor((nowMs - new Date(t.endDateTime).getTime()) / (1000 * 60 * 60 * 24))
-        }))
+        overdueCount: o.overdueTasks.length,
+        tasks: formatTasks(taskCache.get(o.project.id))
       }))
     });
 
