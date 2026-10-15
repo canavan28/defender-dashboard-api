@@ -168,7 +168,32 @@ async function fetchProjectTasks(projectId) {
     filter: [{ field: 'projectID', op: 'eq', value: projectId }],
     maxRecords: 500
   });
+  // Same pagination caveat as fetchOpenProjects: a single project's task
+  // list has been well under 500 in every sample pulled (largest seen: 40),
+  // but if this ever warns, the task counts below would be undercounted.
+  if (response.data.pageDetails?.nextPageUrl) {
+    console.warn(`[Standup] Tasks query for project ${projectId} has more pages than fetched — pagination needed!`);
+  }
   return response.data.items || [];
+}
+
+// A task counts as done if it has a completedDateTime OR its status is
+// Complete (5). Used for BOTH the progress count and the overdue-task
+// check so the two can never disagree about whether a task is finished.
+function isTaskDone(t) {
+  return !!t.completedDateTime || t.status === 5;
+}
+
+// "% Complete - Tasks" — what AutoTask's own project page shows as
+// "0 of 3 (0%)". Deliberately NOT the project's completedPercentage
+// field, which is the HOURS-based percentage ("% Complete - Hours") and
+// reads 100% whenever logged hours meet the estimate, even with tasks
+// still open. Returns null when the project has no tasks (or the task
+// fetch failed), so the UI can show a dash instead of a fake 0%.
+function summarizeTaskProgress(tasks) {
+  if (!tasks || tasks.length === 0) return null;
+  const done = tasks.filter(isTaskDone).length;
+  return { done, total: tasks.length, percent: Math.round((done / tasks.length) * 100) };
 }
 
 // ── Route ──────────────────────────────────────────────────────────────────
@@ -248,6 +273,30 @@ router.get('/data', async (req, res, next) => {
 
     await sleep(300);
 
+    // ── Project tasks — fetched ONCE per project and shared ───────────────
+    // Needed for the engineering list's task-based progress AND the
+    // onboarding overdue check. Several onboarding projects also appear in
+    // the engineering list (blank department), so this cache avoids
+    // querying the same project twice. A failed fetch stores null, so one
+    // bad project shows "—" for progress instead of blanking a section.
+    const taskCache = new Map();
+    const getProjectTasks = async (proj) => {
+      if (taskCache.has(proj.id)) return taskCache.get(proj.id);
+      await sleep(200);
+      let tasks = null;
+      try {
+        tasks = await fetchProjectTasks(proj.id);
+      } catch (err) {
+        console.warn(`[Standup] Failed to fetch tasks for project ${proj.id} (${proj.projectName}):`, err.message);
+      }
+      taskCache.set(proj.id, tasks);
+      return tasks;
+    };
+
+    for (const p of engineeringProjects) {
+      await getProjectTasks(p);
+    }
+
     // ── Onboarding projects + their overdue tasks ──────────────────────────
     const onboardingProjectsRaw = await fetchOpenProjects([
       { field: 'projectName', op: 'contains', value: 'Onboarding' },
@@ -256,16 +305,10 @@ router.get('/data', async (req, res, next) => {
 
     const onboardingOverdue = [];
     for (const proj of onboardingProjectsRaw) {
-      await sleep(200);
-      let tasks = [];
-      try {
-        tasks = await fetchProjectTasks(proj.id);
-      } catch (err) {
-        console.warn(`[Standup] Failed to fetch tasks for project ${proj.id} (${proj.projectName}):`, err.message);
-        continue; // one bad project shouldn't blank the whole onboarding section
-      }
+      const tasks = await getProjectTasks(proj);
+      if (!tasks) continue; // one bad project shouldn't blank the whole onboarding section
       const overdueTasks = tasks.filter(t =>
-        !t.completedDateTime && t.endDateTime && new Date(t.endDateTime).getTime() < nowMs
+        !isTaskDone(t) && t.endDateTime && new Date(t.endDateTime).getTime() < nowMs
       );
       if (overdueTasks.length > 0) {
         onboardingOverdue.push({ project: proj, overdueTasks });
@@ -314,7 +357,7 @@ router.get('/data', async (req, res, next) => {
         companyName: companyMap[String(p.companyID)] || 'Unknown',
         status: p.status,
         statusLabel: PROJECT_STATUS_LABELS[p.status] || String(p.status),
-        percentComplete: p.completedPercentage,
+        taskProgress: summarizeTaskProgress(taskCache.get(p.id)),
         endDateTime: p.endDateTime,
         isOverdue: !!(p.endDateTime && new Date(p.endDateTime).getTime() < nowMs),
         projectLead: resourceMap[p.projectLeadResourceID] || null
@@ -324,7 +367,7 @@ router.get('/data', async (req, res, next) => {
         projectId: o.project.id,
         projectName: o.project.projectName,
         companyName: companyMap[String(o.project.companyID)] || 'Unknown',
-        percentComplete: o.project.completedPercentage,
+        taskProgress: summarizeTaskProgress(taskCache.get(o.project.id)),
         tasks: o.overdueTasks.map(t => ({
           taskNumber: t.taskNumber,
           title: t.title,
