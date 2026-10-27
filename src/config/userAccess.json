@@ -17,6 +17,12 @@
     "defaultCategory": "operations",
     "defaultTab": "Ticket overview"
   },
+  "604f553d-d441-47cd-9bd9-fc9ceda9b0c2": {
+    "name": "Brian Robinson",
+    "categories": ["operations", "sales", "customer-success"],
+    "defaultCategory": "customer-success",
+    "defaultTab": "Customer Success"
+  },
   "18b456d7-e1c0-47e3-ae91-aa546fc38c25": {
     "name": "Brianna Canavan",
     "categories": ["operations", "sales", "customer-success", "finance"],
