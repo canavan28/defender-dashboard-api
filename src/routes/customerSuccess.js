@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { autotaskClient, getHeaders } = require('../utils/autotask');
+const { requireOwner } = require('../middleware/auth');
 // NOTE: verifyApiKey is NOT re-applied here — index.js already applies it
 // globally to everything under /api via `app.use('/api', verifyApiKey)`,
 // so req.user is guaranteed populated by the time these handlers run.
@@ -210,6 +211,233 @@ function describeAutotaskError(err) {
     data: err.response?.data,
   };
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PREVIEW of the revised scoring rules (Phase 2) — READ-ONLY.
+// GET /api/customer-success/preview computes what every client's score WOULD
+// be under the new rules, and returns the breakdown. It never writes to
+// csScores.json, so it's safe to run as often as needed. The real /sync above
+// is unchanged until the new rules are confirmed.
+//
+// Revised rules (confirmed with Matt):
+//   - Everything is a rolling 12-month window — SLA breaches, surveys, AND
+//     manual entries all drop off after a year.
+//   - SLA breach costs 0.25 points (was 1).
+//   - A ticket only counts as breached if its due time has actually passed:
+//       no first response AND due date is in the past, OR
+//       first response came after the due date.
+//     (The old sync permanently recorded any not-yet-answered ticket as a
+//     breach, even if it wasn't due yet.)
+//   - RMM Resolved tickets (status 20) never count.
+//   - Only certain queues count (below). Excluded per Matt: Merged, Internal
+//     Projects, Sales, Web Development, SaaS Alerts, Co-Managed, Account
+//     Manager, OnBoarding.
+//   - No floor yet — scores can go negative, deliberately, so the real
+//     distribution is visible before deciding on a floor.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const PREVIEW_BREACH_DELTA = -0.25;
+
+const QUEUE_NAMES = {
+  5: 'Client Portal', 6: 'OnBoarding', 8: 'Monitoring Alert', 29682833: 'Support',
+  29683378: 'InfoTank Internal Projects', 29683479: 'Merged Tickets', 29683480: 'Sales',
+  29683481: 'Web Development', 29683482: 'Triage', 29683487: 'Co-Managed',
+  29683491: 'Account Manager', 29683492: 'Management', 29683493: 'Hardware as a Service',
+  29683494: 'SaaS Alerts', 29683496: 'After Hours', 29683497: 'Olaro Group',
+};
+
+// Queues whose breaches count toward the score.
+const COUNTED_QUEUES = new Set([5, 8, 29682833, 29683482, 29683496, 29683497]);
+// Not decided yet — NOT counted in newScore, but reported separately so the
+// impact of including them is visible.
+const UNDECIDED_QUEUES = new Set([29683492, 29683493]); // Management, Hardware as a Service
+const RMM_RESOLVED_STATUS = 20;
+
+function queueLabel(id) {
+  return QUEUE_NAMES[id] || `Unknown queue ${id}`;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+async function buildPreview() {
+  const now = new Date();
+  const since = trailing12MonthsISO();
+  const sinceMs = new Date(since).getTime();
+  const errors = [];
+
+  let companyNameMap = {};
+  let excludedCompanyIds = new Set(EXCLUDE_CS_COMPANIES);
+  try {
+    const info = await fetchCompanyInfo();
+    companyNameMap = info.nameMap;
+    excludedCompanyIds = info.excludedIds;
+  } catch (err) {
+    errors.push({ step: 'company_info', ...describeAutotaskError(err) });
+  }
+
+  const clients = {};
+  const getClient = (companyId) => {
+    const key = String(companyId);
+    if (!clients[key]) {
+      clients[key] = {
+        companyId: key,
+        companyName: companyNameMap[key] || null,
+        breaches: 0,
+        breachTickets: [],
+        undecidedQueueBreaches: {},
+        surveys: 0,
+        surveyPoints: 0,
+        manualKept: 0,
+        manualPoints: 0,
+        manualExpired: 0,
+      };
+    }
+    return clients[key];
+  };
+
+  // Ticket-level counters for the whole run, so it's clear what got filtered.
+  const totals = {
+    ticketsChecked: 0,
+    breachesCounted: 0,
+    skippedRmmResolved: 0,
+    skippedNotYetDue: 0,
+    skippedExcludedQueue: {},
+    undecidedQueue: {},
+    skippedExcludedCompany: 0,
+  };
+
+  // --- SLA breaches (12 months) ---
+  try {
+    const raw = await queryAll('Tickets', {
+      filter: [
+        { field: 'createDate', op: 'gte', value: since },
+        { field: 'firstResponseDueDateTime', op: 'exist' },
+      ],
+    });
+    const tickets = [...new Map(raw.map((t) => [t.id, t])).values()];
+    for (const t of tickets) {
+      totals.ticketsChecked++;
+      const due = new Date(t.firstResponseDueDateTime).getTime();
+      const responded = t.firstResponseDateTime ? new Date(t.firstResponseDateTime).getTime() : null;
+      const breached = responded == null ? due < now.getTime() : responded > due;
+
+      // Count the reason a would-be breach was skipped, in priority order.
+      if (!breached) {
+        if (responded == null) totals.skippedNotYetDue++;
+        continue;
+      }
+      if (!t.companyID || excludedCompanyIds.has(t.companyID)) {
+        totals.skippedExcludedCompany++;
+        continue;
+      }
+      if (t.status === RMM_RESOLVED_STATUS) {
+        totals.skippedRmmResolved++;
+        continue;
+      }
+      const qName = queueLabel(t.queueID);
+      if (UNDECIDED_QUEUES.has(t.queueID)) {
+        totals.undecidedQueue[qName] = (totals.undecidedQueue[qName] || 0) + 1;
+        const c = getClient(t.companyID);
+        c.undecidedQueueBreaches[qName] = (c.undecidedQueueBreaches[qName] || 0) + 1;
+        continue;
+      }
+      if (!COUNTED_QUEUES.has(t.queueID)) {
+        totals.skippedExcludedQueue[qName] = (totals.skippedExcludedQueue[qName] || 0) + 1;
+        continue;
+      }
+      const c = getClient(t.companyID);
+      c.breaches++;
+      c.breachTickets.push({ ticketNumber: t.ticketNumber, queue: qName, created: t.createDate });
+      totals.breachesCounted++;
+    }
+  } catch (err) {
+    errors.push({ step: 'sla_breaches', ...describeAutotaskError(err) });
+  }
+
+  // --- Surveys (12 months) — same point curve as today ---
+  try {
+    const surveyResults = await queryAll('SurveyResults', {
+      filter: [{ field: 'completeDate', op: 'gte', value: since }],
+    });
+    for (const r of surveyResults) {
+      if (r.surveyRating == null || !r.companyID || excludedCompanyIds.has(r.companyID)) continue;
+      const c = getClient(r.companyID);
+      c.surveys++;
+      c.surveyPoints += surveyRatingToPoints(r.surveyRating);
+    }
+  } catch (err) {
+    errors.push({ step: 'surveys', ...describeAutotaskError(err) });
+  }
+
+  // --- Manual entries from the existing ledger (12 months) ---
+  // Also guarantees every client that has a score today appears in the
+  // preview, so old vs new can be compared side by side.
+  const data = loadData();
+  for (const [key, stored] of Object.entries(data.clients)) {
+    if (excludedCompanyIds.has(Number(key))) continue;
+    const c = getClient(key);
+    c.currentScore = round2(computeScore(stored));
+    if (!c.companyName && stored.companyName) c.companyName = stored.companyName;
+    for (const e of stored.events) {
+      if (e.enteredBy === null) continue; // system events are recomputed above
+      if (new Date(e.date).getTime() >= sinceMs) {
+        c.manualKept++;
+        c.manualPoints += e.delta;
+      } else {
+        c.manualExpired++;
+      }
+    }
+  }
+
+  const rows = Object.values(clients).map((c) => {
+    const breachPoints = c.breaches * PREVIEW_BREACH_DELTA;
+    const undecidedCount = Object.values(c.undecidedQueueBreaches).reduce((a, b) => a + b, 0);
+    const newScore = BASE_SCORE + breachPoints + c.surveyPoints + c.manualPoints;
+    return {
+      companyId: c.companyId,
+      companyName: c.companyName,
+      currentScore: c.currentScore ?? null,
+      newScore: round2(newScore),
+      newScoreIfUndecidedQueuesCounted: round2(newScore + undecidedCount * PREVIEW_BREACH_DELTA),
+      breaches: c.breaches,
+      breachPoints: round2(breachPoints),
+      surveys: c.surveys,
+      surveyPoints: round2(c.surveyPoints),
+      manualKept: c.manualKept,
+      manualPoints: round2(c.manualPoints),
+      manualExpired: c.manualExpired,
+      undecidedQueueBreaches: c.undecidedQueueBreaches,
+      breachTickets: c.breachTickets,
+    };
+  }).sort((a, b) => a.newScore - b.newScore);
+
+  return {
+    generatedAt: now.toISOString(),
+    windowStart: since,
+    rules: {
+      base: BASE_SCORE,
+      breachDelta: PREVIEW_BREACH_DELTA,
+      countedQueues: [...COUNTED_QUEUES].map(queueLabel),
+      undecidedQueues: [...UNDECIDED_QUEUES].map(queueLabel),
+      floor: null,
+    },
+    totals,
+    errors,
+    clients: rows,
+  };
+}
+
+// GET /api/customer-success/preview — owner-only, read-only dry run.
+// Can take a minute or two (12 months of tickets from AutoTask).
+router.get('/preview', requireOwner, async (req, res, next) => {
+  try {
+    res.json(await buildPreview());
+  } catch (err) {
+    next(err);
+  }
+});
 
 // GET /api/customer-success/scores — summary list, all clients
 router.get('/scores', (req, res) => {
