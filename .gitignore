@@ -1,2 +1,9 @@
 node_modules/
 .env
+
+# Test/diagnostic output (curl -o results etc.) — never commit these.
+# They can contain real client data. Only the top-level folder is affected;
+# nothing under src/ is ignored.
+/*.json
+!/package.json
+!/package-lock.json
