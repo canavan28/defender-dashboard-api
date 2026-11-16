@@ -1,18 +1,19 @@
 const express = require('express');
 const router = express.Router();
-const fs = require('fs');
-const path = require('path');
-const { autotaskClient } = require('../utils/autotask');
+const axios = require('axios');
+const { autotaskClient, getHeaders } = require('../utils/autotask');
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ── File paths — reading existing caches/data files directly, same pattern
-// aireview.js's /analyze-tech route already uses to read tickets-historical.json
-// and tickets-recent.json off disk rather than re-fetching from AutoTask.
-const CACHE_DIR = '/app/data';
-const TICKETS_HISTORICAL_FILE = path.join(CACHE_DIR, 'tickets-historical.json');
-const TICKETS_RECENT_FILE = path.join(CACHE_DIR, 'tickets-recent.json');
-const REVIEWED_FILE = path.join(CACHE_DIR, 'reviewed.json');
+// ── Live data, not the shared ticket cache ──────────────────────────────────
+// This route used to read open tickets from tickets-recent.json on disk. That
+// file only gets rebuilt when someone loads the main dashboard (which calls
+// /api/tickets/all), so the standup's "Refresh now" button and its hourly
+// auto-refresh just re-read the same stale file — only a full page reload
+// produced new data. Open tickets are now queried straight from AutoTask on
+// every request, using the exact same queue + status rules tickets.js uses
+// for its own "open" list (kept in sync by hand — see INCLUDE_QUEUES and
+// EXCLUDE_OPEN_STATUSES below).
 
 // ── Constants confirmed via diagnostic testing this session ──────────────────
 
@@ -24,11 +25,11 @@ const REVIEWED_FILE = path.join(CACHE_DIR, 'reviewed.json');
 const SCHEDULED_STATUS_IDS = [22, 41];
 const SCHEDULED_STATUS_LABELS = { 22: 'Scheduled - Phone Call', 41: 'Scheduled - Onsite' };
 
-// "Open" ticket definition — reused EXACTLY from tickets.js's EXCLUDE_STATUSES
-// ([5, 20] = Complete, RMM Resolved) rather than redefining "open" a second
-// time. We read recentCache.openTickets directly below, which tickets.js
-// already builds using this exact status exclusion, so we don't even need to
-// re-apply the filter ourselves here.
+// "Open" ticket definition — copied from tickets.js (INCLUDE_QUEUES and
+// EXCLUDE_STATUSES there). If either list changes in tickets.js, change it
+// here too, or the standup and the Operations tabs will disagree.
+const INCLUDE_QUEUES = [5, 29682833, 29683482, 29683496, 29683497];
+const EXCLUDE_OPEN_STATUSES = [5, 20]; // Complete, RMM Resolved
 
 // Web Dev exclusion for dragging tickets — confirmed via /api/diagnostic/
 // ticket-fields this session. Tickets have NO department field at all
@@ -64,11 +65,6 @@ const DRAGGING_AGED_DAYS = 7;
 const DRAGGING_AGED_STALLED_HOURS = 24;
 const DRAGGING_TIME_ENTRY_THRESHOLD = 5; // "more than 5" => 6+
 
-// AI escalations shown on the standup: only these severities (Matt: "High
-// and Critical"). Lower severities are counted but not listed.
-const AI_ESCALATION_SEVERITIES = new Set(['critical', 'high']);
-const AI_SEV_RANK = { critical: 0, high: 1 };
-
 // Full ticket status picklist — decoded from /api/diagnostic/ticket-fields.
 // Replaces the earlier scheduled-only label map so dragging tickets show a
 // readable status instead of a raw number.
@@ -91,16 +87,30 @@ const PROJECT_STATUS_LABELS = {
 };
 const CLIENT_PROJECT_TYPE = 5; // excludes Template(3)/Proposal(2)/Internal(4)/Baseline(8)
 
-// ── File helpers ──────────────────────────────────────────────────────────────
-function loadJsonFile(filePath) {
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    }
-  } catch (err) {
-    console.error(`[Standup] Failed to load ${filePath}:`, err.message);
+// ── Paginated AutoTask query ─────────────────────────────────────────────────
+// Same confirmed pattern as customerSuccess.js / tickets.js on this zone:
+// continuation pages need POST (not GET) and the original filter body resent.
+async function queryAll(entity, body) {
+  const first = await autotaskClient.post(`/${entity}/query`, body);
+  let items = first.data.items || [];
+  let nextUrl = first.data.pageDetails?.nextPageUrl;
+  while (nextUrl) {
+    await sleep(300);
+    const page = await axios.post(nextUrl, body, { headers: getHeaders() });
+    items = items.concat(page.data.items || []);
+    nextUrl = page.data.pageDetails?.nextPageUrl;
   }
-  return null;
+  return items;
+}
+
+async function fetchOpenTickets() {
+  return queryAll('Tickets', {
+    filter: [
+      { op: 'or', items: INCLUDE_QUEUES.map(id => ({ field: 'queueID', op: 'eq', value: id })) },
+      { op: 'and', items: EXCLUDE_OPEN_STATUSES.map(id => ({ field: 'status', op: 'noteq', value: id })) }
+    ],
+    maxRecords: 500
+  });
 }
 
 // ── Company name resolution — same pattern used in tickets.js/aireview.js ────
@@ -143,22 +153,21 @@ async function fetchResourceNames() {
 }
 
 // ── Time entry counts per ticket — bulk query using the 'in' operator ────────
-// NOTE: 'in' is confirmed working on /Companies/query elsewhere in this
-// codebase but has NOT been tested on /TimeEntries/query before now. If this
-// throws/400s, that's useful diagnostic signal — the error will surface in
-// the route's response via the catch-all below, and we'll need to either
-// fall back to per-ticket queries or find the right op for this entity.
 async function fetchTimeEntryCounts(ticketIds) {
   const counts = {};
   if (!ticketIds.length) return counts;
   const CHUNK = 500;
   for (let i = 0; i < ticketIds.length; i += CHUNK) {
     const chunk = ticketIds.slice(i, i + CHUNK);
-    const response = await autotaskClient.post('/TimeEntries/query', {
+    // Paginated: 500 open tickets can easily have more than 500 time
+    // entries between them. The old single-page query silently undercounted,
+    // which meant the "more than 5 time entries" dragging rule could miss
+    // tickets.
+    const items = await queryAll('TimeEntries', {
       filter: [{ field: 'ticketID', op: 'in', value: chunk }],
       maxRecords: 500
     });
-    (response.data.items || []).forEach(te => {
+    items.forEach(te => {
       counts[te.ticketID] = (counts[te.ticketID] || 0) + 1;
     });
     if (i + CHUNK < ticketIds.length) await sleep(300);
@@ -221,61 +230,15 @@ function summarizeTaskProgress(tasks) {
   return { done, total: tasks.length, percent: Math.round((done / tasks.length) * 100) };
 }
 
-// ── AI flag de-duplication ───────────────────────────────────────────────────
-// Many flags are the same alert firing repeatedly (e.g. the same Datto backup
-// error raised as 5 separate tickets). Two flags are treated as duplicates
-// when their normalized titles match: lowercased, parenthetical bits (device
-// IDs like "(405b7f640de0)") and long hex strings removed, leading Fw:/Re:
-// stripped, punctuation collapsed. Titles that are merely reworded versions
-// of the same alert will NOT match — that's a deliberate limit, since a
-// looser rule (e.g. same company + same flag type) would merge genuinely
-// different problems at a busy client.
-function normalizeTitle(title) {
-  return String(title || '')
-    .toLowerCase()
-    .replace(/^\s*((fw|fwd|re)\s*:\s*)+/g, '')
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/\b[0-9a-f]{8,}\b/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-// Keeps one flag per duplicate group — the most severe, then most recently
-// flagged — and records how many others it stands in for. Nothing is
-// silently dropped: the UI shows "+N similar" on the survivor.
-function groupDuplicateFlags(flags) {
-  const groups = new Map();
-  for (const f of flags) {
-    const key = normalizeTitle(f.title) || `__untitled__${f.id}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(f);
-  }
-  const best = (a, b) => {
-    const sevDiff = (AI_SEV_RANK[a.sev] ?? 9) - (AI_SEV_RANK[b.sev] ?? 9);
-    if (sevDiff !== 0) return sevDiff;
-    return new Date(b.dateFlagged).getTime() - new Date(a.dateFlagged).getTime();
-  };
-  return [...groups.values()].map(group => {
-    const sorted = [...group].sort(best);
-    return { ...sorted[0], similarCount: group.length - 1 };
-  });
-}
-
 // ── Route ──────────────────────────────────────────────────────────────────
 router.get('/data', async (req, res, next) => {
   try {
     const now = new Date();
     const nowMs = now.getTime();
 
-    // ── Tickets: read straight from tickets.js's existing disk caches ──────
-    // recentCache.openTickets is EXACTLY tickets.js's own "open" definition
-    // (status not in [5, 20]) — reused as-is, not redefined here.
-    const recentCache = loadJsonFile(TICKETS_RECENT_FILE);
-    const openTickets = recentCache?.openTickets || [];
-
-    if (!recentCache) {
-      console.warn('[Standup] tickets-recent.json not found on disk — has the main dashboard synced tickets at least once?');
-    }
+    // ── Tickets: live from AutoTask on every request (see top of file) ────
+    const openTickets = await fetchOpenTickets();
+    await sleep(300);
 
     // ── Scheduled tickets ───────────────────────────────────────────────────
     const scheduledTicketsRaw = openTickets.filter(t => SCHEDULED_STATUS_IDS.includes(t.status));
@@ -323,32 +286,6 @@ router.get('/data', async (req, res, next) => {
       // Worst first = longest since last update. Tickets caught only by the
       // time-entry rule have recent activity, so they sort toward the end.
       .sort((a, b) => (b.hoursSinceActivity ?? -1) - (a.hoursSinceActivity ?? -1));
-
-    // ── AI Review escalations — direct read of reviewed.json's flags array ─
-    // Restricted to the last 7 days (by dateFlagged, not the underlying
-    // ticket's age — a ticket can be old but only just got flagged, or
-    // vice versa) since this is a DAILY standup, not a running backlog of
-    // every unactioned flag going back months.
-    const sevenDaysAgoMs = nowMs - 7 * 24 * 60 * 60 * 1000;
-    const reviewedData = loadJsonFile(REVIEWED_FILE);
-    // id is the ticket number; a few old flags lack it (past AI Review glitch)
-    // and would render with a broken link, so they're skipped entirely.
-    const recentUnactioned = (reviewedData?.flags || []).filter(f =>
-      f.id &&
-      f.action === 'unactioned' &&
-      f.dateFlagged &&
-      new Date(f.dateFlagged).getTime() >= sevenDaysAgoMs
-    );
-    // Standup shows high + critical only, with repeats grouped (see
-    // groupDuplicateFlags). Anything lower is counted so the UI can point
-    // at the AI Review tab instead of hiding it without a trace.
-    const importantFlags = recentUnactioned.filter(f => AI_ESCALATION_SEVERITIES.has(f.sev));
-    const aiEscalationsOtherCount = recentUnactioned.length - importantFlags.length;
-    const aiEscalations = groupDuplicateFlags(importantFlags).sort((a, b) => {
-      const sevDiff = (AI_SEV_RANK[a.sev] ?? 9) - (AI_SEV_RANK[b.sev] ?? 9);
-      if (sevDiff !== 0) return sevDiff;
-      return new Date(b.dateFlagged).getTime() - new Date(a.dateFlagged).getTime();
-    });
 
     // ── Engineering projects ────────────────────────────────────────────────
     const engineeringProjectsRaw = await fetchOpenProjects([
@@ -467,9 +404,6 @@ router.get('/data', async (req, res, next) => {
         timeEntryCount: d.timeEntryCount,
         reasons: d.reasons
       })),
-
-      aiEscalations,
-      aiEscalationsOtherCount,
 
       engineeringProjects: engineeringProjects.map(p => ({
         id: p.id,

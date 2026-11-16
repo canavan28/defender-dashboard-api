@@ -4,7 +4,6 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const ticketsRouter = require('./routes/tickets');
-const aiReviewRouter = require('./routes/aireview');
 const vtoRouter = require('./routes/vto');
 const upsellsRouter = require('./routes/upsells');
 const salesMetricsRouter = require('./routes/salesMetrics');
@@ -117,7 +116,6 @@ app.get('/api/me/preview/:oid', requireOwner, (req, res) => {
 });
 
 app.use('/api/tickets', ticketsRouter);
-app.use('/api/aireview', aiReviewRouter);
 app.use('/api/vto', vtoRouter);
 app.use('/api/upsells', upsellsRouter);
 app.use('/api/sales', salesMetricsRouter);
@@ -127,49 +125,10 @@ app.use('/api/team-rocks', teamRocksRouter);
 app.use('/api/standup', standupRouter);
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
-app.post('/api/admin/reset-reviewed-since', requireOwner, async (req, res) => {
-  try {
-    const { since } = req.body;
-    if (!since) return res.status(400).json({ error: 'since (ISO date string) required' });
-
-    const fs = require('fs');
-    const reviewedFile = '/app/data/reviewed.json';
-    const data = JSON.parse(fs.readFileSync(reviewedFile, 'utf8'));
-
-    const cutoff = new Date(since);
-    if (isNaN(cutoff.getTime())) {
-      return res.status(400).json({ error: 'since must be a valid ISO date string' });
-    }
-
-    let cleared = 0;
-    let kept = 0;
-    const newReviewed = {};
-
-    Object.entries(data.reviewed || {}).forEach(([ticketNum, meta]) => {
-      const reviewedAt = meta?.reviewedAt ? new Date(meta.reviewedAt) : null;
-      if (reviewedAt && reviewedAt >= cutoff) {
-        cleared++;
-      } else {
-        newReviewed[ticketNum] = meta;
-        kept++;
-      }
-    });
-
-    data.reviewed = newReviewed;
-    fs.writeFileSync(reviewedFile, JSON.stringify(data, null, 2));
-
-    console.warn(`[Admin] ${req.user.name || req.user.oid} reset reviewed entries since ${cutoff.toISOString()}`);
-
-    res.json({
-      ok: true,
-      clearedReviewed: cleared,
-      kept,
-      cutoff: cutoff.toISOString()
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// AI Review (routes/aireview.js) and its /api/admin/reset-reviewed-since
+// helper were retired in the Phase 1 cleanup — ticket review now comes from
+// Thread. /app/data/reviewed.json is intentionally left on the disk volume
+// untouched, in case the old flag history is ever wanted again.
 
 // Moved under /api (so the global verifyApiKey gate applies) and now
 // requireOwner-gated, since this exposes raw per-tech ticket data and isn't
