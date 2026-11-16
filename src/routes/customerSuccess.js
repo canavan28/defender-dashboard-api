@@ -1,20 +1,36 @@
 // src/routes/customerSuccess.js
 //
-// Customer Success scoring — event-ledger model. Each client's score is
-// 10 (base) + sum of all event deltas, no ceiling. Two kinds of events:
-//   - System-generated (sla_breach, autotask_review) — cannot be deleted,
-//     only corrected by re-sync.
-//   - Manual (google_review, positive_tbr, negative_tbr, manual_adjustment)
-//     — entered by an exec, requires a note. CONFIRMED: any exec with
-//     Customer Success access can delete any manual entry, not just their own.
+// Customer Success scoring — event ledger, revised in Phase 2 (Nov 2026).
 //
-// SLA breach definition CONFIRMED against useTicketMetrics.js (matches both
-// the SLA Health tab's top-line breach rate and the tech-grading SLA score):
-//   eligible  = ticket has firstResponseDueDateTime
-//   breached  = no firstResponseDateTime, OR firstResponseDateTime is later
-//               than firstResponseDueDateTime
-// No queue/company/priority exclusions apply here — those only affect the
-// separate response-time scoring metric in tech grading, not this breach flag.
+// SCORE = 10 (base)
+//       + SLA breaches × -0.25
+//       + survey points (positive total capped at +10; negatives uncapped)
+//       + manual entries
+// Everything counts over a ROLLING 12-MONTH window: breaches, surveys and
+// manual entries all stop counting a year after their date. No floor —
+// scores can go negative (deliberately, until the real spread is reviewed).
+//
+// SYSTEM events (sla_breach, autotask_review) are REBUILT FROM SCRATCH on
+// every sync over the trailing 12 months. The old sync appended events and
+// never revisited them, which caused the -57 scores: a ticket that hadn't
+// been answered yet at sync time got recorded as a breach forever, nothing
+// ever expired, and every queue (alerts, sales, merged…) counted.
+//
+// MANUAL events (google_review, positive_tbr, negative_tbr,
+// manual_adjustment) stay in the ledger permanently for history, but only
+// count toward the score while they're under 12 months old. Any exec with
+// Customer Success access can delete any manual entry.
+//
+// SLA breach rules (confirmed with Matt):
+//   - breached = first response came after the due time, OR no first
+//     response yet AND the due time has already passed
+//   - RMM Resolved (status 20) never counts
+//   - only these queues count: Client Portal, Support, Triage, After Hours,
+//     Olaro Group. Excluded: Monitoring Alert, SaaS Alerts, Merged, Internal
+//     Projects, Sales, Web Development, Co-Managed, Account Manager,
+//     OnBoarding, Management, Hardware as a Service.
+// Excluded companies: 0 (InfoTank internal), 344 (NJC), 626 ("Unspecified"
+// placeholder), plus anything classified Web Dev (classification 19).
 
 const express = require('express');
 const axios = require('axios');
@@ -23,69 +39,37 @@ const path = require('path');
 const { randomUUID } = require('crypto');
 const { autotaskClient, getHeaders } = require('../utils/autotask');
 const { requireOwner } = require('../middleware/auth');
-// NOTE: verifyApiKey is NOT re-applied here — index.js already applies it
-// globally to everything under /api via `app.use('/api', verifyApiKey)`,
-// so req.user is guaranteed populated by the time these handlers run.
+// verifyApiKey is applied globally to /api in index.js, so req.user is set.
 
 const router = express.Router();
 
 const DATA_FILE = path.join('/app/data', 'csScores.json');
-const BASE_SCORE = 10;
-const PAGE_SLEEP_MS = 400; // pace paginated calls, mirrors sla.js's existing sleep() pattern
-
+const PAGE_SLEEP_MS = 400;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-let cache = null;
+// ── Scoring rules ────────────────────────────────────────────────────────────
+const BASE_SCORE = 10;
+const BREACH_DELTA = -0.25;
+const SURVEY_POSITIVE_CAP = 10;
+const WINDOW_MONTHS = 12;
 
-function loadData() {
-  if (cache) return cache;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    // Migrate away from the old single shared `lastSync` checkpoint (bug:
-    // it advanced even when a step failed, so a failed step would silently
-    // skip its missed window on the next run instead of retrying it).
-    // Deliberately NOT carrying the old value forward — dropping it forces
-    // one full trailing-12-month re-pull to backfill whatever was missed,
-    // then per-step checkpoints take over cleanly from there.
-    if ('lastSync' in parsed) {
-      delete parsed.lastSync;
-    }
-    parsed.lastSyncSlaBreaches = parsed.lastSyncSlaBreaches || null;
-    parsed.lastSyncSurveys = parsed.lastSyncSurveys || null;
-    cache = parsed;
-  } catch (err) {
-    cache = { clients: {}, lastSyncSlaBreaches: null, lastSyncSurveys: null };
-  }
-  return cache;
-}
+const QUEUE_NAMES = {
+  5: 'Client Portal', 6: 'OnBoarding', 8: 'Monitoring Alert', 29682833: 'Support',
+  29683378: 'InfoTank Internal Projects', 29683479: 'Merged Tickets', 29683480: 'Sales',
+  29683481: 'Web Development', 29683482: 'Triage', 29683487: 'Co-Managed',
+  29683491: 'Account Manager', 29683492: 'Management', 29683493: 'Hardware as a Service',
+  29683494: 'SaaS Alerts', 29683496: 'After Hours', 29683497: 'Olaro Group',
+};
+const COUNTED_QUEUES = new Set([5, 29682833, 29683482, 29683496, 29683497]);
+const RMM_RESOLVED_STATUS = 20;
 
-function saveData(data) {
-  cache = data;
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
+const EXCLUDE_CS_COMPANIES = new Set([0, 344, 626]);
+const WEB_DEV_CLASSIFICATION = 19;
 
-function ensureClient(data, companyId, companyName) {
-  const key = String(companyId);
-  if (!data.clients[key]) {
-    data.clients[key] = { companyId: key, companyName: companyName || null, events: [] };
-  }
-  if (companyName) data.clients[key].companyName = companyName;
-  return data.clients[key];
-}
-
-function computeScore(client) {
-  return BASE_SCORE + client.events.reduce((sum, e) => sum + e.delta, 0);
-}
-
-function dedupeExists(client, type, sourceKey, sourceValue) {
-  return client.events.some(
-    (e) => e.type === type && e.source && e.source[sourceKey] === sourceValue
-  );
-}
+const MANUAL_TYPES = ['google_review', 'positive_tbr', 'negative_tbr', 'manual_adjustment'];
 
 // Piecewise-linear survey rating -> points. Confirmed with Matt:
-// 1=-2, 2=-1, 3=-1, 4=0, 5=+1. Handles decimal surveyRating values
-// (e.g. 4.33) by interpolating within the relevant segment.
+// 1=-2, 2=-1, 3=-1, 4=0, 5=+1. Interpolates decimal ratings (e.g. 4.33).
 const SURVEY_CURVE = [
   { rating: 1, points: -2 },
   { rating: 2, points: -1 },
@@ -107,15 +91,123 @@ function surveyRatingToPoints(rating) {
   return 0;
 }
 
-// Follows AutoTask's pageDetails.nextPageUrl pagination, paced with a
-// short sleep between pages to stay under rate limits. CONFIRMED against
-// this instance (zone webservices14):
-//   1. GET on nextPageUrl -> 405 (general AT docs say GET works; this zone
-//      disagrees and requires POST).
-//   2. POST with an empty body -> 500 "Value cannot be null. Parameter
-//      name: filters" — so the original filter body must be resent on
-//      every page, even though the paging cursor itself is already
-//      encoded in the URL's querystring.
+const round2 = (n) => Math.round(n * 100) / 100;
+const queueLabel = (id) => QUEUE_NAMES[id] || `Unknown queue ${id}`;
+
+function windowStartDate() {
+  const d = new Date();
+  d.setMonth(d.getMonth() - WINDOW_MONTHS);
+  return d;
+}
+
+// ── Storage ──────────────────────────────────────────────────────────────────
+let cache = null;
+
+function loadData() {
+  if (cache) return cache;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    delete parsed.lastSync; // legacy shared checkpoint, no longer used
+    parsed.clients = parsed.clients || {};
+    cache = parsed;
+  } catch (err) {
+    cache = { clients: {} };
+  }
+  return cache;
+}
+
+function saveData(data) {
+  cache = data;
+  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+}
+
+function ensureClient(data, companyId, companyName) {
+  const key = String(companyId);
+  if (!data.clients[key]) {
+    data.clients[key] = { companyId: key, companyName: companyName || null, events: [] };
+  }
+  if (companyName) data.clients[key].companyName = companyName;
+  return data.clients[key];
+}
+
+// ── Score calculation ────────────────────────────────────────────────────────
+// The single source of truth for a client's score. Every route uses this,
+// so the list, the detail panel and the preview can never disagree.
+function scoreBreakdown(client) {
+  const startMs = windowStartDate().getTime();
+  const inWindow = (e) => new Date(e.date).getTime() >= startMs;
+
+  let breaches = 0;
+  let surveys = 0;
+  let surveyPositive = 0;
+  let surveyNegative = 0;
+  let manualPoints = 0;
+  let manualCounted = 0;
+  let manualExpired = 0;
+
+  for (const e of client.events) {
+    if (!inWindow(e)) {
+      if (e.enteredBy !== null) manualExpired++;
+      continue;
+    }
+    if (e.type === 'sla_breach') {
+      breaches++;
+    } else if (e.type === 'autotask_review') {
+      surveys++;
+      if (e.delta > 0) surveyPositive += e.delta;
+      else surveyNegative += e.delta;
+    } else {
+      manualCounted++;
+      manualPoints += e.delta;
+    }
+  }
+
+  const breachPoints = breaches * BREACH_DELTA;
+  const surveyPointsCounted = Math.min(surveyPositive, SURVEY_POSITIVE_CAP) + surveyNegative;
+  const score = BASE_SCORE + breachPoints + surveyPointsCounted + manualPoints;
+
+  return {
+    score: round2(score),
+    breakdown: {
+      base: BASE_SCORE,
+      breaches,
+      breachPoints: round2(breachPoints),
+      surveys,
+      surveyPointsRaw: round2(surveyPositive + surveyNegative),
+      surveyPointsCounted: round2(surveyPointsCounted),
+      surveyCapApplied: surveyPositive > SURVEY_POSITIVE_CAP,
+      manualCounted,
+      manualPoints: round2(manualPoints),
+      manualExpired,
+    },
+  };
+}
+
+// Full client record for the detail panel: score, breakdown, and each event
+// marked with whether it still counts (false = older than 12 months).
+function clientResponse(client) {
+  const startMs = windowStartDate().getTime();
+  const { score, breakdown } = scoreBreakdown(client);
+  return {
+    ...client,
+    score,
+    breakdown,
+    rules: {
+      base: BASE_SCORE,
+      breachDelta: BREACH_DELTA,
+      surveyPositiveCap: SURVEY_POSITIVE_CAP,
+      windowMonths: WINDOW_MONTHS,
+    },
+    events: client.events.map((e) => ({
+      ...e,
+      counts: new Date(e.date).getTime() >= startMs,
+    })),
+  };
+}
+
+// ── AutoTask helpers ─────────────────────────────────────────────────────────
+// Pagination on this zone (webservices14): continuation pages need POST, and
+// the original filter body must be resent on every page.
 async function queryAll(entity, body) {
   let items = [];
   const first = await autotaskClient.post(`/${entity}/query`, body);
@@ -130,30 +222,9 @@ async function queryAll(entity, body) {
   return items;
 }
 
-// Companies excluded entirely from Customer Success scoring — not real
-// external clients tracked the normal way. Mirrors EXCLUDE_RESPONSE_COMPANIES
-// in useTicketMetrics.js, which excludes the same two IDs for the same
-// underlying reason:
-//   0   = InfoTank internal
-//   344 = NJC
-const EXCLUDE_CS_COMPANIES = new Set([0, 344]);
-
-// "Web Dev Customer" classification value, confirmed via an earlier
-// classification-picklist pull against this AutoTask instance (not listed
-// anywhere in the admin UI directly — this is the numeric picklist value
-// AutoTask stores on Company.classification).
-const WEB_DEV_CLASSIFICATION = 19;
-
-// Resolves companyID -> companyName directly from AutoTask's own Companies
-// entity, rather than relying on the dashboard's ticket-derived companyMap
-// (which doesn't necessarily cover every company these queries touch —
-// hence some clients showing as "Company #351" etc.). Also determines the
-// full exclusion set for this run: the fixed IDs above, plus any company
-// currently classified as Web Dev Customer (classification 19), since that
-// classification can change/be reassigned over time and isn't safe to
-// hardcode as a static ID list the way NJC/internal are.
-// Best-effort: if this fails, sync continues without names or dynamic
-// exclusion (falling back to just the fixed IDs) rather than blocking.
+// Company names + the full exclusion set for this run (fixed IDs plus any
+// company currently classified Web Dev). Best-effort: on failure, falls back
+// to the fixed IDs and no names.
 async function fetchCompanyInfo() {
   const companies = await queryAll('Companies', {
     filter: [{ field: 'id', op: 'gte', value: 0 }],
@@ -163,17 +234,13 @@ async function fetchCompanyInfo() {
   for (const c of companies) {
     if (c.id == null) continue;
     nameMap[String(c.id)] = c.companyName;
-    if (Number(c.classification) === WEB_DEV_CLASSIFICATION) {
-      excludedIds.add(c.id);
-    }
+    if (Number(c.classification) === WEB_DEV_CLASSIFICATION) excludedIds.add(c.id);
   }
   return { nameMap, excludedIds };
 }
 
-// SurveyResults only gives a ticketID foreign key, not the human-readable
-// ticketNumber techs/AMs actually recognize — this resolves that in
-// batches (AutoTask's 'in' filter operator, confirmed supported) rather
-// than one query per survey result.
+// SurveyResults only carry ticketID; this resolves human-readable ticket
+// numbers in batches using the 'in' operator.
 async function fetchTicketNumberMap(ticketIds) {
   const unique = [...new Set(ticketIds.filter(Boolean))];
   const map = {};
@@ -183,25 +250,13 @@ async function fetchTicketNumberMap(ticketIds) {
     const tickets = await queryAll('Tickets', {
       filter: [{ field: 'id', op: 'in', value: chunk }],
     });
-    for (const t of tickets) {
-      map[t.id] = t.ticketNumber;
-    }
+    for (const t of tickets) map[t.id] = t.ticketNumber;
     if (i + CHUNK < unique.length) await sleep(PAGE_SLEEP_MS);
   }
   return map;
 }
 
-function trailing12MonthsISO() {
-  const d = new Date();
-  d.setFullYear(d.getFullYear() - 1);
-  return d.toISOString();
-}
-
-// Extracts full diagnostic detail from an AutoTask API error. The debug
-// interceptor in autotask.js only logs response bodies for 429/500 — this
-// makes sure errors of ANY status (like the 405 we hit on first sync) show
-// up with enough detail to actually diagnose, instead of axios's generic
-// "Request failed with status code X".
+// Full detail on AutoTask errors of any status, not just axios's generic text.
 function describeAutotaskError(err) {
   return {
     message: err.message,
@@ -212,103 +267,36 @@ function describeAutotaskError(err) {
   };
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// PREVIEW of the revised scoring rules (Phase 2) — READ-ONLY.
-// GET /api/customer-success/preview computes what every client's score WOULD
-// be under the new rules, and returns the breakdown. It never writes to
-// csScores.json, so it's safe to run as often as needed. The real /sync above
-// is unchanged until the new rules are confirmed.
-//
-// Revised rules (confirmed with Matt):
-//   - Everything is a rolling 12-month window — SLA breaches, surveys, AND
-//     manual entries all drop off after a year.
-//   - SLA breach costs 0.25 points (was 1).
-//   - A ticket only counts as breached if its due time has actually passed:
-//       no first response AND due date is in the past, OR
-//       first response came after the due date.
-//     (The old sync permanently recorded any not-yet-answered ticket as a
-//     breach, even if it wasn't due yet.)
-//   - RMM Resolved tickets (status 20) never count.
-//   - Only certain queues count (below). Excluded per Matt: Merged, Internal
-//     Projects, Sales, Web Development, SaaS Alerts, Co-Managed, Account
-//     Manager, OnBoarding.
-//   - No floor yet — scores can go negative, deliberately, so the real
-//     distribution is visible before deciding on a floor.
-// ═════════════════════════════════════════════════════════════════════════════
-
-const PREVIEW_BREACH_DELTA = -0.25;
-
-const QUEUE_NAMES = {
-  5: 'Client Portal', 6: 'OnBoarding', 8: 'Monitoring Alert', 29682833: 'Support',
-  29683378: 'InfoTank Internal Projects', 29683479: 'Merged Tickets', 29683480: 'Sales',
-  29683481: 'Web Development', 29683482: 'Triage', 29683487: 'Co-Managed',
-  29683491: 'Account Manager', 29683492: 'Management', 29683493: 'Hardware as a Service',
-  29683494: 'SaaS Alerts', 29683496: 'After Hours', 29683497: 'Olaro Group',
-};
-
-// Queues whose breaches count toward the score.
-const COUNTED_QUEUES = new Set([5, 8, 29682833, 29683482, 29683496, 29683497]);
-// Not decided yet — NOT counted in newScore, but reported separately so the
-// impact of including them is visible.
-const UNDECIDED_QUEUES = new Set([29683492, 29683493]); // Management, Hardware as a Service
-const RMM_RESOLVED_STATUS = 20;
-
-function queueLabel(id) {
-  return QUEUE_NAMES[id] || `Unknown queue ${id}`;
-}
-
-function round2(n) {
-  return Math.round(n * 100) / 100;
-}
-
-async function buildPreview() {
+// ── Build all system events for the trailing 12 months ───────────────────────
+// Used by both /sync (which saves them) and /preview (which doesn't).
+// breachEvents / surveyEvents are null if that step failed, so the caller
+// can keep the previous events for that type instead of wiping them.
+async function buildSystemEvents() {
   const now = new Date();
-  const since = trailing12MonthsISO();
-  const sinceMs = new Date(since).getTime();
+  const since = windowStartDate().toISOString();
   const errors = [];
 
-  let companyNameMap = {};
-  let excludedCompanyIds = new Set(EXCLUDE_CS_COMPANIES);
+  let nameMap = {};
+  let excludedIds = new Set(EXCLUDE_CS_COMPANIES);
   try {
     const info = await fetchCompanyInfo();
-    companyNameMap = info.nameMap;
-    excludedCompanyIds = info.excludedIds;
+    nameMap = info.nameMap;
+    excludedIds = info.excludedIds;
   } catch (err) {
     errors.push({ step: 'company_info', ...describeAutotaskError(err) });
   }
 
-  const clients = {};
-  const getClient = (companyId) => {
-    const key = String(companyId);
-    if (!clients[key]) {
-      clients[key] = {
-        companyId: key,
-        companyName: companyNameMap[key] || null,
-        breaches: 0,
-        breachTickets: [],
-        undecidedQueueBreaches: {},
-        surveys: 0,
-        surveyPoints: 0,
-        manualKept: 0,
-        manualPoints: 0,
-        manualExpired: 0,
-      };
-    }
-    return clients[key];
-  };
-
-  // Ticket-level counters for the whole run, so it's clear what got filtered.
   const totals = {
     ticketsChecked: 0,
     breachesCounted: 0,
-    skippedRmmResolved: 0,
     skippedNotYetDue: 0,
-    skippedExcludedQueue: {},
-    undecidedQueue: {},
+    skippedRmmResolved: 0,
     skippedExcludedCompany: 0,
+    skippedExcludedQueue: {},
   };
 
-  // --- SLA breaches (12 months) ---
+  // --- SLA breaches ---
+  let breachEvents = null;
   try {
     const raw = await queryAll('Tickets', {
       filter: [
@@ -317,157 +305,137 @@ async function buildPreview() {
       ],
     });
     const tickets = [...new Map(raw.map((t) => [t.id, t])).values()];
+    breachEvents = {};
     for (const t of tickets) {
       totals.ticketsChecked++;
       const due = new Date(t.firstResponseDueDateTime).getTime();
       const responded = t.firstResponseDateTime ? new Date(t.firstResponseDateTime).getTime() : null;
       const breached = responded == null ? due < now.getTime() : responded > due;
-
-      // Count the reason a would-be breach was skipped, in priority order.
       if (!breached) {
         if (responded == null) totals.skippedNotYetDue++;
         continue;
       }
-      if (!t.companyID || excludedCompanyIds.has(t.companyID)) {
-        totals.skippedExcludedCompany++;
-        continue;
-      }
-      if (t.status === RMM_RESOLVED_STATUS) {
-        totals.skippedRmmResolved++;
-        continue;
-      }
-      const qName = queueLabel(t.queueID);
-      if (UNDECIDED_QUEUES.has(t.queueID)) {
-        totals.undecidedQueue[qName] = (totals.undecidedQueue[qName] || 0) + 1;
-        const c = getClient(t.companyID);
-        c.undecidedQueueBreaches[qName] = (c.undecidedQueueBreaches[qName] || 0) + 1;
-        continue;
-      }
+      if (!t.companyID || excludedIds.has(t.companyID)) { totals.skippedExcludedCompany++; continue; }
+      if (t.status === RMM_RESOLVED_STATUS) { totals.skippedRmmResolved++; continue; }
       if (!COUNTED_QUEUES.has(t.queueID)) {
-        totals.skippedExcludedQueue[qName] = (totals.skippedExcludedQueue[qName] || 0) + 1;
+        const q = queueLabel(t.queueID);
+        totals.skippedExcludedQueue[q] = (totals.skippedExcludedQueue[q] || 0) + 1;
         continue;
       }
-      const c = getClient(t.companyID);
-      c.breaches++;
-      c.breachTickets.push({ ticketNumber: t.ticketNumber, queue: qName, created: t.createDate });
       totals.breachesCounted++;
+      const key = String(t.companyID);
+      (breachEvents[key] = breachEvents[key] || []).push({
+        id: `evt_${randomUUID()}`,
+        type: 'sla_breach',
+        delta: BREACH_DELTA,
+        date: t.createDate,
+        source: { ticketId: t.id, ticketNumber: t.ticketNumber, queue: queueLabel(t.queueID) },
+        enteredBy: null,
+      });
     }
   } catch (err) {
-    errors.push({ step: 'sla_breaches', ...describeAutotaskError(err) });
+    breachEvents = null;
+    errors.push({ step: 'sla_breaches', since, ...describeAutotaskError(err) });
   }
 
-  // --- Surveys (12 months) — same point curve as today ---
+  // --- AutoTask surveys ---
+  let surveyEvents = null;
   try {
-    const surveyResults = await queryAll('SurveyResults', {
+    const results = await queryAll('SurveyResults', {
       filter: [{ field: 'completeDate', op: 'gte', value: since }],
     });
-    for (const r of surveyResults) {
-      if (r.surveyRating == null || !r.companyID || excludedCompanyIds.has(r.companyID)) continue;
-      const c = getClient(r.companyID);
-      c.surveys++;
-      c.surveyPoints += surveyRatingToPoints(r.surveyRating);
+    let ticketNumberMap = {};
+    try {
+      ticketNumberMap = await fetchTicketNumberMap(results.map((r) => r.ticketID));
+    } catch (err) {
+      errors.push({ step: 'survey_ticket_numbers', ...describeAutotaskError(err) });
+    }
+    surveyEvents = {};
+    for (const r of results) {
+      if (r.surveyRating == null || !r.companyID || excludedIds.has(r.companyID)) continue;
+      const key = String(r.companyID);
+      (surveyEvents[key] = surveyEvents[key] || []).push({
+        id: `evt_${randomUUID()}`,
+        type: 'autotask_review',
+        delta: surveyRatingToPoints(r.surveyRating),
+        date: r.completeDate,
+        source: {
+          ticketId: r.ticketID,
+          ticketNumber: ticketNumberMap[r.ticketID] || null,
+          surveyResultId: r.id,
+          rating: r.surveyRating,
+        },
+        enteredBy: null,
+      });
     }
   } catch (err) {
-    errors.push({ step: 'surveys', ...describeAutotaskError(err) });
+    surveyEvents = null;
+    errors.push({ step: 'autotask_survey', since, ...describeAutotaskError(err) });
   }
 
-  // --- Manual entries from the existing ledger (12 months) ---
-  // Also guarantees every client that has a score today appears in the
-  // preview, so old vs new can be compared side by side.
-  const data = loadData();
-  for (const [key, stored] of Object.entries(data.clients)) {
-    if (excludedCompanyIds.has(Number(key))) continue;
-    const c = getClient(key);
-    c.currentScore = round2(computeScore(stored));
-    if (!c.companyName && stored.companyName) c.companyName = stored.companyName;
-    for (const e of stored.events) {
-      if (e.enteredBy === null) continue; // system events are recomputed above
-      if (new Date(e.date).getTime() >= sinceMs) {
-        c.manualKept++;
-        c.manualPoints += e.delta;
-      } else {
-        c.manualExpired++;
-      }
-    }
-  }
-
-  const rows = Object.values(clients).map((c) => {
-    const breachPoints = c.breaches * PREVIEW_BREACH_DELTA;
-    const undecidedCount = Object.values(c.undecidedQueueBreaches).reduce((a, b) => a + b, 0);
-    const newScore = BASE_SCORE + breachPoints + c.surveyPoints + c.manualPoints;
-    return {
-      companyId: c.companyId,
-      companyName: c.companyName,
-      currentScore: c.currentScore ?? null,
-      newScore: round2(newScore),
-      newScoreIfUndecidedQueuesCounted: round2(newScore + undecidedCount * PREVIEW_BREACH_DELTA),
-      breaches: c.breaches,
-      breachPoints: round2(breachPoints),
-      surveys: c.surveys,
-      surveyPoints: round2(c.surveyPoints),
-      manualKept: c.manualKept,
-      manualPoints: round2(c.manualPoints),
-      manualExpired: c.manualExpired,
-      undecidedQueueBreaches: c.undecidedQueueBreaches,
-      breachTickets: c.breachTickets,
-    };
-  }).sort((a, b) => a.newScore - b.newScore);
-
-  return {
-    generatedAt: now.toISOString(),
-    windowStart: since,
-    rules: {
-      base: BASE_SCORE,
-      breachDelta: PREVIEW_BREACH_DELTA,
-      countedQueues: [...COUNTED_QUEUES].map(queueLabel),
-      undecidedQueues: [...UNDECIDED_QUEUES].map(queueLabel),
-      floor: null,
-    },
-    totals,
-    errors,
-    clients: rows,
-  };
+  return { generatedAt: now.toISOString(), windowStart: since, nameMap, excludedIds, breachEvents, surveyEvents, totals, errors };
 }
 
-// GET /api/customer-success/preview — owner-only, read-only dry run.
-// Can take a minute or two (12 months of tickets from AutoTask).
-router.get('/preview', requireOwner, async (req, res, next) => {
-  try {
-    res.json(await buildPreview());
-  } catch (err) {
-    next(err);
+// Applies freshly built system events to a ledger (in place). Only replaces a
+// type whose step succeeded; manual events are never touched.
+function applySystemEvents(data, built) {
+  const { nameMap, excludedIds, breachEvents, surveyEvents } = built;
+
+  for (const key of Object.keys(data.clients)) {
+    if (excludedIds.has(Number(key))) delete data.clients[key];
   }
-});
+
+  const replace = (type, byClient) => {
+    if (!byClient) return; // step failed — keep previous events of this type
+    for (const c of Object.values(data.clients)) {
+      c.events = c.events.filter((e) => e.type !== type);
+    }
+    for (const [key, events] of Object.entries(byClient)) {
+      ensureClient(data, key, nameMap[key]).events.push(...events);
+    }
+  };
+  replace('sla_breach', breachEvents);
+  replace('autotask_review', surveyEvents);
+
+  for (const [key, c] of Object.entries(data.clients)) {
+    if (nameMap[key]) c.companyName = nameMap[key];
+    c.events.sort((a, b) => new Date(a.date) - new Date(b.date));
+    if (c.events.length === 0) delete data.clients[key];
+  }
+}
+
+// ── Routes ───────────────────────────────────────────────────────────────────
 
 // GET /api/customer-success/scores — summary list, all clients
 router.get('/scores', (req, res) => {
   const data = loadData();
-  const summary = Object.values(data.clients).map((c) => ({
-    companyId: c.companyId,
-    companyName: c.companyName,
-    score: computeScore(c),
-    eventCount: c.events.length,
-  }));
+  const summary = Object.values(data.clients).map((c) => {
+    const { score, breakdown } = scoreBreakdown(c);
+    return {
+      companyId: c.companyId,
+      companyName: c.companyName,
+      score,
+      breaches: breakdown.breaches,
+      surveys: breakdown.surveys,
+      eventCount: c.events.length,
+    };
+  });
   res.json(summary);
 });
 
-// GET /api/customer-success/scores/:companyId — full ledger for one client
+// GET /api/customer-success/scores/:companyId — full ledger + breakdown
 router.get('/scores/:companyId', (req, res) => {
   const data = loadData();
   const client = data.clients[req.params.companyId];
   if (!client) return res.status(404).json({ error: 'No score record for this client yet' });
-  res.json({ ...client, score: computeScore(client) });
+  res.json(clientResponse(client));
 });
 
 // POST /api/customer-success/scores/:companyId/events — manual entry
-// body: { type: 'google_review'|'positive_tbr'|'negative_tbr'|'manual_adjustment', delta: number, note: string, companyName?: string }
 router.post('/scores/:companyId/events', (req, res) => {
   const { type, delta, note, companyName } = req.body;
-  const enteredBy = req.user?.oid || null;
-
-  const allowedManualTypes = ['google_review', 'positive_tbr', 'negative_tbr', 'manual_adjustment'];
-  if (!allowedManualTypes.includes(type)) {
-    return res.status(400).json({ error: `type must be one of ${allowedManualTypes.join(', ')}` });
+  if (!MANUAL_TYPES.includes(type)) {
+    return res.status(400).json({ error: `type must be one of ${MANUAL_TYPES.join(', ')}` });
   }
   if (typeof delta !== 'number' || Number.isNaN(delta)) {
     return res.status(400).json({ error: 'delta must be a number' });
@@ -475,7 +443,6 @@ router.post('/scores/:companyId/events', (req, res) => {
   if (!note || !note.trim()) {
     return res.status(400).json({ error: 'note is required for manual entries' });
   }
-
   const data = loadData();
   const client = ensureClient(data, req.params.companyId, companyName);
   client.events.push({
@@ -483,17 +450,15 @@ router.post('/scores/:companyId/events', (req, res) => {
     type,
     delta,
     date: new Date().toISOString(),
-    enteredBy,
+    enteredBy: req.user?.oid || null,
     note,
   });
   saveData(data);
-  res.json({ ...client, score: computeScore(client) });
+  res.json(clientResponse(client));
 });
 
 // DELETE /api/customer-success/scores/:companyId/events/:eventId
-// Confirmed: any exec with Customer Success access can delete any manual
-// entry, not just their own. System-generated events (enteredBy === null)
-// cannot be deleted here — they only get corrected by re-running /sync.
+// Manual entries only — system events are corrected by re-syncing.
 router.delete('/scores/:companyId/events/:eventId', (req, res) => {
   const data = loadData();
   const client = data.clients[req.params.companyId];
@@ -505,139 +470,71 @@ router.delete('/scores/:companyId/events/:eventId', (req, res) => {
   }
   client.events.splice(idx, 1);
   saveData(data);
-  res.json({ ...client, score: computeScore(client) });
+  res.json(clientResponse(client));
 });
 
-// POST /api/customer-success/sync — pulls SLA breaches + AutoTask survey
-// results since each step's own last-successful-run checkpoint, appends
-// system-generated events.
-router.post('/sync', async (req, res) => {
-  const data = loadData();
-  const errors = [];
-  const overrideSince = req.body?.since; // manual override, if provided, applies to both steps
-
-  // Best-effort company info resolution (names + dynamic Web Dev exclusion).
-  // Doesn't block the rest of sync if it fails — falls back to just the
-  // fixed NJC/internal exclusions and no display names for this run.
-  let companyNameMap = {};
-  let excludedCompanyIds = new Set(EXCLUDE_CS_COMPANIES);
+// POST /api/customer-success/sync — rebuilds all system events for the
+// trailing 12 months and saves them. Takes a minute or two.
+router.post('/sync', async (req, res, next) => {
   try {
-    const info = await fetchCompanyInfo();
-    companyNameMap = info.nameMap;
-    excludedCompanyIds = info.excludedIds;
+    const built = await buildSystemEvents();
+    const data = loadData();
+    applySystemEvents(data, built);
+    if (built.breachEvents) data.lastSyncSlaBreaches = built.generatedAt;
+    if (built.surveyEvents) data.lastSyncSurveys = built.generatedAt;
+    data.rulesVersion = 2;
+    saveData(data);
+    res.json({ ok: true, errors: built.errors, totals: built.totals });
   } catch (err) {
-    errors.push({ step: 'company_info', ...describeAutotaskError(err) });
+    next(err);
   }
+});
 
-  // Self-heal: remove any client records for excluded companies that were
-  // captured before their exclusion existed (e.g. NJC breaches pulled during
-  // the first full-history sync, or Web Dev clients pulled before this
-  // classification-based exclusion was added).
-  for (const key of Object.keys(data.clients)) {
-    if (excludedCompanyIds.has(Number(key))) {
-      delete data.clients[key];
-    }
-  }
-
-  // First-ever sync (no checkpoint yet) defaults to trailing 12 months,
-  // matching the Finance pillar's confirmed reporting window — not all-time,
-  // to avoid pulling years of tickets/surveys in one shot.
-  const slaSince = overrideSince || data.lastSyncSlaBreaches || trailing12MonthsISO();
-  const surveySince = overrideSince || data.lastSyncSurveys || trailing12MonthsISO();
-
-  // --- SLA breaches ---
-  // Matches useTicketMetrics.js exactly: eligible = has firstResponseDueDateTime;
-  // breached = no firstResponseDateTime, or it's later than the due date.
-  // Filtered incrementally by createDate (ticket creation), same field the
-  // rest of the dashboard uses for quarterly bucketing.
-  // NEEDS VERIFICATION: the 'exist' filter operator below — confirm AutoTask's
-  // REST API actually supports this op name (some AutoTask docs list it as
-  // 'exist'/'notExist', but this hasn't been tested against your instance).
-  // Also note: filtering by createDate means a ticket created just before
-  // "since" whose due date only lapses after "since" could be missed on a
-  // given incremental run — low-risk in practice since due dates are usually
-  // set within the same day as creation, but flagging the tradeoff.
-  let slaBreachesOk = false;
+// GET /api/customer-success/preview — owner-only, READ-ONLY. Shows what each
+// client's score would be after a sync right now, next to the saved score.
+// Kept for checking future rule changes before they go live.
+router.get('/preview', requireOwner, async (req, res, next) => {
   try {
-    const tickets = await queryAll('Tickets', {
-      filter: [
-        { field: 'createDate', op: 'gte', value: slaSince },
-        { field: 'firstResponseDueDateTime', op: 'exist' },
-      ],
+    const built = await buildSystemEvents();
+    const saved = loadData();
+    const copy = JSON.parse(JSON.stringify(saved));
+    applySystemEvents(copy, built);
+
+    const ids = new Set(
+      [...Object.keys(saved.clients), ...Object.keys(copy.clients)]
+        .filter((key) => !built.excludedIds.has(Number(key)))
+    );
+    const clients = [...ids].map((key) => {
+      const before = saved.clients[key];
+      const after = copy.clients[key];
+      const afterScore = after ? scoreBreakdown(after) : { score: BASE_SCORE, breakdown: null };
+      return {
+        companyId: key,
+        companyName: (after || before).companyName,
+        currentScore: before ? scoreBreakdown(before).score : null,
+        newScore: afterScore.score,
+        breakdown: afterScore.breakdown,
+      };
+    }).sort((a, b) => a.newScore - b.newScore);
+
+    res.json({
+      generatedAt: built.generatedAt,
+      windowStart: built.windowStart,
+      rules: {
+        base: BASE_SCORE,
+        breachDelta: BREACH_DELTA,
+        surveyPositiveCap: SURVEY_POSITIVE_CAP,
+        countedQueues: [...COUNTED_QUEUES].map(queueLabel),
+        excludedCompanies: [...EXCLUDE_CS_COMPANIES],
+        floor: null,
+      },
+      totals: built.totals,
+      errors: built.errors,
+      clients,
     });
-    for (const ticket of tickets) {
-      if (!ticket.companyID || excludedCompanyIds.has(ticket.companyID)) continue;
-      const breached =
-        !ticket.firstResponseDateTime ||
-        new Date(ticket.firstResponseDateTime) > new Date(ticket.firstResponseDueDateTime);
-      if (!breached) continue;
-
-      const client = ensureClient(data, ticket.companyID, companyNameMap[String(ticket.companyID)]);
-      if (dedupeExists(client, 'sla_breach', 'ticketId', ticket.id)) continue;
-      client.events.push({
-        id: `evt_${randomUUID()}`,
-        type: 'sla_breach',
-        delta: -1,
-        date: ticket.createDate,
-        source: { ticketId: ticket.id, ticketNumber: ticket.ticketNumber },
-        enteredBy: null,
-      });
-    }
-    slaBreachesOk = true;
   } catch (err) {
-    errors.push({ step: 'sla_breaches', since: slaSince, ...describeAutotaskError(err) });
+    next(err);
   }
-
-  // --- AutoTask survey results ---
-  let surveysOk = false;
-  try {
-    const surveyResults = await queryAll('SurveyResults', {
-      filter: [{ field: 'completeDate', op: 'gte', value: surveySince }],
-    });
-
-    // Best-effort ticket number resolution — a failure here shouldn't
-    // block survey scoring, it just means those entries show no ticket
-    // number this run (falls back to null, same as before this existed).
-    let ticketNumberMap = {};
-    try {
-      ticketNumberMap = await fetchTicketNumberMap(surveyResults.map(r => r.ticketID));
-    } catch (err) {
-      errors.push({ step: 'survey_ticket_numbers', ...describeAutotaskError(err) });
-    }
-
-    for (const result of surveyResults) {
-      if (result.surveyRating == null || !result.companyID || excludedCompanyIds.has(result.companyID)) continue;
-      const client = ensureClient(data, result.companyID, companyNameMap[String(result.companyID)]);
-      if (dedupeExists(client, 'autotask_review', 'surveyResultId', result.id)) continue;
-      client.events.push({
-        id: `evt_${randomUUID()}`,
-        type: 'autotask_review',
-        delta: surveyRatingToPoints(result.surveyRating),
-        date: result.completeDate,
-        source: {
-          ticketId: result.ticketID,
-          ticketNumber: ticketNumberMap[result.ticketID] || null,
-          surveyResultId: result.id,
-          rating: result.surveyRating,
-        },
-        enteredBy: null,
-      });
-    }
-    surveysOk = true;
-  } catch (err) {
-    errors.push({ step: 'autotask_survey', since: surveySince, ...describeAutotaskError(err) });
-  }
-
-  // Only advance a step's checkpoint if it actually succeeded — a failed
-  // step must retry its full original window next time, not silently skip
-  // ahead to "now". This is the exact bug that caused the first successful
-  // sync to only look back a couple minutes instead of the full 12 months.
-  const now = new Date().toISOString();
-  if (slaBreachesOk) data.lastSyncSlaBreaches = now;
-  if (surveysOk) data.lastSyncSurveys = now;
-
-  saveData(data);
-  res.json({ ok: true, errors });
 });
 
 module.exports = router;
