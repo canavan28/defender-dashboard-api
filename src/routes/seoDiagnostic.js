@@ -8,6 +8,7 @@ const {
   runPagespeed, summarizePagespeed
 } = require('../utils/google');
 const { readPage, getSiteHost, getHomepageUrl } = require('../utils/siteReader');
+const { listRecentPosts, listAllPages, daysSince } = require('../utils/wordpress');
 const { brightlocalClient } = require('../utils/brightlocal');
 
 // Owner-only test routes for the SEO agent's data connections. Mounted at
@@ -17,8 +18,15 @@ const { brightlocalClient } = require('../utils/brightlocal');
 // failing source doesn't hide the others.
 
 function errInfo(err) {
-  return { error: err.message, status: err.response?.status, body: err.response?.data };
+  return { error: err.message, code: err.code, status: err.response?.status, body: err.response?.data };
 }
+
+// Named User-Agent presets for testing what SiteGround lets through
+// from Railway: ?ua=curl, ?ua=axios, or any custom string.
+const UA_PRESETS = {
+  curl: 'curl/8.9.1',
+  axios: 'axios/1.6.0'
+};
 
 // GET /api/diagnostic/seo/config
 // Confirms the Railway variables are present and parse correctly.
@@ -95,16 +103,41 @@ router.get('/google', async (req, res) => {
   res.json(out);
 });
 
-// GET /api/diagnostic/seo/page?url=https://...
+// GET /api/diagnostic/seo/page?url=https://...&ua=curl
 // Reads one page of our own site. With no url, reads the homepage.
+// Optional ua: a preset name (curl, axios) or any custom User-Agent string.
 router.get('/page', async (req, res) => {
   const url = req.query.url || getHomepageUrl();
   if (!url) return res.status(400).json({ error: 'No url passed and GSC_SITE_URL is not set' });
+  const userAgent = req.query.ua ? (UA_PRESETS[req.query.ua] || req.query.ua) : undefined;
   try {
-    res.json(await readPage(url));
+    res.json(await readPage(url, { userAgent }));
   } catch (err) {
-    res.status(500).json(errInfo(err));
+    res.status(500).json({ userAgentTried: userAgent || '(default)', ...errInfo(err) });
   }
+});
+
+// GET /api/diagnostic/seo/wordpress
+// Latest blog posts (with days since the last one) and the full page list,
+// from the site's public WordPress API.
+router.get('/wordpress', async (req, res) => {
+  const out = {};
+  try {
+    const { total, posts } = await listRecentPosts(10);
+    out.totalPosts = total;
+    out.daysSinceLastPost = posts.length ? daysSince(posts[0].published) : null;
+    out.recentPosts = posts;
+  } catch (err) {
+    out.posts = errInfo(err);
+  }
+  try {
+    const pages = await listAllPages();
+    out.totalPages = pages.length;
+    out.pages = pages;
+  } catch (err) {
+    out.pagesError = errInfo(err);
+  }
+  res.json(out);
 });
 
 // GET /api/diagnostic/seo/pagespeed?url=https://...&strategy=mobile
@@ -125,6 +158,7 @@ router.get('/pagespeed', async (req, res) => {
 // GET /api/diagnostic/seo/brightlocal?path=/manage/v1/locations
 // Pass-through for exploring BrightLocal's API. Only reaches
 // api.brightlocal.com; any other query parameters are forwarded.
+// TRIAL KEY: 1,000 lifetime requests. Every call here uses one.
 router.get('/brightlocal', async (req, res) => {
   const path = req.query.path;
   if (!path || !path.startsWith('/') || path.startsWith('//') || path.includes('..') || path.includes('://')) {

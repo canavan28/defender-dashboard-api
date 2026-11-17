@@ -5,7 +5,13 @@ const cheerio = require('cheerio');
 // Restricted to the domain in GSC_SITE_URL (and its subdomains) on
 // purpose: the SEO agent will feed this text to Claude, and pages from
 // the open web can contain hidden text written to manipulate AI.
+//
+// User-Agent: SiteGround's bot protection on infotank.com drops
+// connections from clients that claim to be a browser but don't behave
+// like one (confirmed: a Chrome User-Agent from curl was blocked, plain
+// curl was not). So we identify honestly as a non-browser tool.
 
+const DEFAULT_USER_AGENT = 'InfoTank-Dashboard/1.0 (+https://infotank.com)';
 const MAX_TEXT_CHARS = 8000;
 const MAX_LIST = 30;
 
@@ -45,7 +51,11 @@ function collectSchemaTypes(node, set) {
   if (node['@graph']) collectSchemaTypes(node['@graph'], set);
 }
 
-async function readPage(url) {
+// options.userAgent overrides the default (used by the diagnostic route
+// to test what SiteGround lets through).
+async function readPage(url, options = {}) {
+  const userAgent = options.userAgent || DEFAULT_USER_AGENT;
+
   let parsed;
   try {
     parsed = new URL(url);
@@ -68,7 +78,7 @@ async function readPage(url) {
     transformResponse: x => x,
     validateStatus: () => true,
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; InfoTankSEOAgent/1.0)',
+      'User-Agent': userAgent,
       'Accept': 'text/html,application/xhtml+xml'
     }
   });
@@ -81,6 +91,7 @@ async function readPage(url) {
     redirected: finalUrl !== parsed.toString(),
     status: res.status,
     responseTimeMs,
+    userAgentUsed: userAgent,
     contentType: res.headers['content-type'] || null,
     xRobotsTag: res.headers['x-robots-tag'] || null
   };
@@ -189,4 +200,4 @@ async function readPage(url) {
   };
 }
 
-module.exports = { readPage, getSiteHost, isAllowedHost, getHomepageUrl };
+module.exports = { readPage, getSiteHost, isAllowedHost, getHomepageUrl, DEFAULT_USER_AGENT };
