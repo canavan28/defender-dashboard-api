@@ -36,8 +36,14 @@ const SEO_AGENT_IDS = (process.env.SEO_AGENT_OBJECT_IDS || '')
   .map(id => id.trim())
   .filter(Boolean);
 
+// Also used by /api/me in index.js, so the frontend knows whether to show
+// the SEO Assistant tab.
+function hasSeoAgentAccess(user) {
+  return !!(user?.isOwner || SEO_AGENT_IDS.includes(user?.oid));
+}
+
 function requireSeoAgentAccess(req, res, next) {
-  if (req.user?.isOwner || SEO_AGENT_IDS.includes(req.user?.oid)) return next();
+  if (hasSeoAgentAccess(req.user)) return next();
   return res.status(403).json({ error: 'SEO agent access required' });
 }
 router.use(requireSeoAgentAccess);
@@ -199,7 +205,7 @@ const TOOLS = [
   },
   {
     name: 'brightlocal_rankings',
-    description: 'Saved BrightLocal local-SEO snapshot (synced weekly, NOT live; always state the data dates). Includes: (1) Local Search Grid: Google Maps / map pack rank measured at each point of a 7x7 grid around the office, run weekly; per keyword summary avg_rank and counts of high/medium/low-ranking points, plus history per run. (2) Local Rank Tracker: rank per keyword per engine (google = desktop organic, google-mobile = mobile organic, google-places = Google Maps listings); null = not in top 100; history per run. If only one run exists, change over time cannot be measured yet. Set include_grid_points_for to a keyword to get every grid point as [lat, lng, rank] (rank 0 or null = not found in the top 20).',
+    description: 'Saved BrightLocal local-SEO snapshot (synced weekly, NOT live; always state the data dates). Includes: (1) Local Search Grid: Google Maps / map pack rank measured at each point of a 7x7 grid around the office, run weekly; per keyword summary avg_rank and counts of high/medium/low-ranking points, plus history per run. (2) Local Rank Tracker: rank per keyword per engine (google = desktop Google results page, google-mobile = mobile Google results page, google-places = Google Maps listings); null = not in top 100; history per run. On google/google-mobile, type "Organic" is a regular link, while type "Local" means the business appeared in the map box shown inside the regular results page (not a regular organic link). If only one run exists, change over time cannot be measured yet. Set include_grid_points_for to a keyword to get every grid point as [lat, lng, rank] (rank 0 or null = not found in the top 20).',
     input_schema: {
       type: 'object',
       properties: {
@@ -523,3 +529,4 @@ router.post('/brightlocal/sync', requireOwner, (req, res) => {
 });
 
 module.exports = router;
+module.exports.hasSeoAgentAccess = hasSeoAgentAccess;

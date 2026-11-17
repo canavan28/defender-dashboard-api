@@ -12,6 +12,7 @@ const licenseAuditRouter = require('./routes/licenseAudit');
 const diagnosticRouter = require('./routes/diagnostic');
 const seoDiagnosticRouter = require('./routes/seoDiagnostic');
 const seoAgentRouter = require('./routes/seoAgent');
+const { hasSeoAgentAccess } = seoAgentRouter;
 const teamRocksRouter = require('./routes/teamRocks');
 const standupRouter = require('./routes/standup');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
@@ -81,7 +82,11 @@ app.get('/api/me', (req, res) => {
     }
   }
 
-  res.json({ oid, name, email, isOwner, categories, defaultCategory, defaultTab });
+  // Per-feature access that doesn't follow categories (e.g. the SEO
+  // Assistant tab lives under Sales but isn't for everyone with Sales).
+  const features = { seoAgent: hasSeoAgentAccess(req.user) };
+
+  res.json({ oid, name, email, isOwner, categories, defaultCategory, defaultTab, features });
 });
 
 // GET /api/me/preview-list — owner-only. Names/oids of everyone in the
@@ -114,6 +119,7 @@ app.get('/api/me/preview/:oid', requireOwner, (req, res) => {
     categories: access.categories,
     defaultCategory: access.defaultCategory,
     defaultTab: access.defaultTab,
+    features: { seoAgent: hasSeoAgentAccess({ oid: targetOid, isOwner: false }) },
     isPreview: true
   });
 });
