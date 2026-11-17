@@ -11,9 +11,11 @@ const customerSuccessRouter = require('./routes/customerSuccess');
 const licenseAuditRouter = require('./routes/licenseAudit');
 const diagnosticRouter = require('./routes/diagnostic');
 const seoDiagnosticRouter = require('./routes/seoDiagnostic');
+const seoAgentRouter = require('./routes/seoAgent');
 const teamRocksRouter = require('./routes/teamRocks');
 const standupRouter = require('./routes/standup');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
+const { startScheduler: startBrightLocalScheduler } = require('./utils/seoBrightLocalStore');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -124,6 +126,9 @@ app.use('/api/customer-success', customerSuccessRouter);
 app.use('/api/license-audit', licenseAuditRouter);
 app.use('/api/team-rocks', teamRocksRouter);
 app.use('/api/standup', standupRouter);
+// SEO agent chat (owners + SEO_AGENT_OBJECT_IDS; access check lives in
+// the router itself).
+app.use('/api/seo-agent', seoAgentRouter);
 // SEO agent data-connection tests (GA4, Search Console, PageSpeed, site
 // reader, BrightLocal, Anthropic). Owner-only, same treatment as the
 // general diagnostic routes below.
@@ -191,4 +196,6 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`Defender Dashboard API running on port ${PORT}`);
+  // Weekly BrightLocal snapshot for the SEO agent (first check 2 min after start).
+  startBrightLocalScheduler();
 });
