@@ -10,6 +10,7 @@ const salesMetricsRouter = require('./routes/salesMetrics');
 const customerSuccessRouter = require('./routes/customerSuccess');
 const licenseAuditRouter = require('./routes/licenseAudit');
 const diagnosticRouter = require('./routes/diagnostic');
+const seoDiagnosticRouter = require('./routes/seoDiagnostic');
 const teamRocksRouter = require('./routes/teamRocks');
 const standupRouter = require('./routes/standup');
 const { verifyApiKey, requireOwner } = require('./middleware/auth');
@@ -123,6 +124,10 @@ app.use('/api/customer-success', customerSuccessRouter);
 app.use('/api/license-audit', licenseAuditRouter);
 app.use('/api/team-rocks', teamRocksRouter);
 app.use('/api/standup', standupRouter);
+// SEO agent data-connection tests (GA4, Search Console, PageSpeed, site
+// reader, BrightLocal, Anthropic). Owner-only, same treatment as the
+// general diagnostic routes below.
+app.use('/api/diagnostic/seo', requireOwner, seoDiagnosticRouter);
 app.use('/api/diagnostic', requireOwner, diagnosticRouter);
 
 // AI Review (routes/aireview.js) and its /api/admin/reset-reviewed-since
